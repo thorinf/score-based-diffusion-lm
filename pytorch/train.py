@@ -569,6 +569,7 @@ def train():
                 global_step += 1
 
                 metrics.update({"learning_rate": optim.param_groups[0]['lr']})
+                metrics.update({"anisotropy": model.compute_anisotropy().item()})
                 wandb.log(metrics, step=global_step)
 
             if ((idx + 1) % 500 == 0) or (idx + 1 == len(dataloader)):
