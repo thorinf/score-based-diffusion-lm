@@ -107,8 +107,6 @@ class MultiHeadAttention(nn.Module):
         self.w_v = nn.Linear(dim, dim, bias=qkv_bias)
         self.w_o = nn.Linear(dim, dim)
 
-        # self.memory = nn.Parameter(torch.randn((1, num_heads, 8, self.head_dim)))
-
         self.rotary_emb = rotary_embedding
 
     def forward(self, q, k, v, mask=None):
@@ -124,15 +122,8 @@ class MultiHeadAttention(nn.Module):
             q = self.rotary_emb.rotate_queries_or_keys(q, seq_dim=2)
             k = self.rotary_emb.rotate_queries_or_keys(k, seq_dim=2)
 
-        # k = torch.concat([self.memory.expand(batch_size, self.num_heads, 8, self.head_dim), k], dim=2)
-        # v = torch.concat([self.memory.expand(batch_size, self.num_heads, 8, self.head_dim), v], dim=2)
-
-        # with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True):
-        #     out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.1 if self.training else 0.0)
-
         score = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         if mask is not None:
-            # mask = F.pad(mask, (8, 0, 0, 0, 0, 0, 0, 0), value=True)
             score = score.masked_fill(mask == 0, -1e9)
         score = F.softmax(score, dim=-1)
         out = score @ v
