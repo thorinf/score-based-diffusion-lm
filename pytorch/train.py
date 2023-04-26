@@ -321,12 +321,16 @@ class ScoreDiffusion:
 
 class DiffusionLM(nn.Module):
     def __init__(self, num_embeddings=1000, embedding_dim=64, model_dim=512, num_layers=8, dropout_prob=0.2,
-                 layerdrop_prob=0.0):
+                 layerdrop_prob=0.0, loss_weights=(1.0, 1.0)):
         super(DiffusionLM, self).__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
         self.model_dim = model_dim
         self.num_layers = num_layers
+        self.dropout_prob = dropout_prob
+        self.layerdrop_prob = layerdrop_prob
+        self.loss_weights = loss_weights
+
         self.embedding_grad_scale = 0.1
         self.interpolate_temperature = 1.0
 
@@ -410,7 +414,7 @@ class DiffusionLM(nn.Module):
 
         loss_diff = loss_diff.mean()
         loss_reconstruction = loss_reconstruction.sum() / num_elems
-        loss = loss_diff + loss_reconstruction
+        loss = self.loss_weights[0] * loss_diff + self.loss_weights[1] * loss_reconstruction
 
         return loss, loss_diff, loss_reconstruction, accuracy
 
@@ -468,7 +472,8 @@ def train():
         model_dim=args.model_dim,
         num_layers=args.num_layers,
         dropout_prob=args.dropout_prob,
-        layerdrop_prob=args.layerdrop_prob
+        layerdrop_prob=args.layerdrop_prob,
+        loss_weights=(1.0, 0.1)
     )
     model.to(device)
 
@@ -519,7 +524,15 @@ def train():
 
     wandb.init(
         project="score-based-diffusion-lm",
-        resume=True
+        config={
+            'num_embeddings': model.num_embeddings,
+            'embedding_dim': model.embedding_dim,
+            'model_dim': model.model_dim,
+            'num_layers': model.num_layers,
+            'dropout_prob': model.dropout_prob,
+            'layerdrop_prob': model.layerdrop_prob,
+            'loss_weights': model.loss_weights
+        }
     )
 
     for ep in range(0, args.epochs):
