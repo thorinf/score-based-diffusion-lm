@@ -4,6 +4,7 @@ import random
 import argparse
 from typing import List
 
+import wandb
 from tqdm import tqdm
 import sentencepiece as spm
 import torch
@@ -106,6 +107,8 @@ class MultiHeadAttention(nn.Module):
         self.w_v = nn.Linear(dim, dim, bias=qkv_bias)
         self.w_o = nn.Linear(dim, dim)
 
+        # self.memory = nn.Parameter(torch.randn((1, num_heads, 8, self.head_dim)))
+
         self.rotary_emb = rotary_embedding
 
     def forward(self, q, k, v, mask=None):
@@ -121,11 +124,15 @@ class MultiHeadAttention(nn.Module):
             q = self.rotary_emb.rotate_queries_or_keys(q, seq_dim=2)
             k = self.rotary_emb.rotate_queries_or_keys(k, seq_dim=2)
 
+        # k = torch.concat([self.memory.expand(batch_size, self.num_heads, 8, self.head_dim), k], dim=2)
+        # v = torch.concat([self.memory.expand(batch_size, self.num_heads, 8, self.head_dim), v], dim=2)
+
         # with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True):
         #     out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.1 if self.training else 0.0)
 
         score = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
         if mask is not None:
+            # mask = F.pad(mask, (8, 0, 0, 0, 0, 0, 0, 0), value=True)
             score = score.masked_fill(mask == 0, -1e9)
         score = F.softmax(score, dim=-1)
         out = score @ v
@@ -154,17 +161,17 @@ class TransformerEncoderLayer(nn.Module):
         self.dropout2 = nn.Dropout(p=drop_prob)
 
     def forward(self, x, mask, gammas=(0.0, 0.0), betas=(0.0, 0.0)):
-        res = x
+        res1 = x
         x = self.norm1(x)
         x = (gammas[0] * x) + betas[0]
         x = self.attention(q=x, k=x, v=x, mask=mask)
-        x = res + self.dropout1(x)
+        x = res1 + self.dropout1(x)
 
-        res = x
+        res2 = x
         x = self.norm2(x)
         x = (gammas[1] * x) + betas[1]
         x = self.ffn(x)
-        x = res + self.dropout2(x)
+        x = res2 + self.dropout2(x)
         return x
 
 
@@ -441,12 +448,12 @@ def train():
     parser.add_argument('-lr', '--learning_rate', type=float, default=1e-4)
     parser.add_argument('-decs', '--decay_steps', type=int, default=800000)
     parser.add_argument('-wd', '--weight_decay', type=float, default=1e-8)
-    parser.add_argument('-acc', '--accumulation_steps', type=int, default=8)
+    parser.add_argument('-acc', '--accumulation_steps', type=int, default=2)
 
     parser.add_argument('-edim', '--embedding_dim', type=int, default=64)
     parser.add_argument('-mdim', '--model_dim', type=int, default=512)
     parser.add_argument('-numl', '--num_layers', type=int, default=8)
-    parser.add_argument('-do', '--dropout_prob', type=float, default=0.0)
+    parser.add_argument('-do', '--dropout_prob', type=float, default=0.1)
     parser.add_argument('-ld', '--layerdrop_prob', type=float, default=0.0)
 
     parser.add_argument('-ckpt', '--checkpoint', type=str, required=True)
@@ -508,6 +515,7 @@ def train():
     optim = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
+        betas=(0.9, 0.99),
         weight_decay=args.weight_decay
     )
 
@@ -517,6 +525,11 @@ def train():
     global_step = checkpoint.get('global_step', 0)
     lr_lambda = lambda step: linear_decay_with_warmup(step, args.learning_rate, 2000, 0, args.decay_steps,
                                                       args.learning_rate * 0.1)
+
+    wandb.init(
+        project="score-based-diffusion-lm",
+        resume=True
+    )
 
     for ep in range(0, args.epochs):
         model.train()
@@ -534,12 +547,14 @@ def train():
             else:
                 ValueError("Loss is not finite, backward pass not computed.")
 
-            pbar.set_postfix({
+            metrics = {
                 "loss": loss.item(),
                 "mse": loss_diff.item(),
                 "ce": loss_reconstruction.item(),
                 "accuracy": accuracy.item(),
-            })
+            }
+
+            pbar.set_postfix(metrics)
 
             if ((idx + 1) % args.accumulation_steps == 0) or (idx + 1 == len(dataloader)):
                 optim.param_groups[0]['lr'] = lr_lambda(global_step)
@@ -548,6 +563,9 @@ def train():
                 optim.zero_grad()
                 torch.cuda.empty_cache()
                 global_step += 1
+
+                metrics.update({"learning_rate": optim.param_groups[0]['lr']})
+                wandb.log(metrics, step=global_step)
 
             if ((idx + 1) % 500 == 0) or (idx + 1 == len(dataloader)):
                 checkpoint = {
@@ -562,6 +580,8 @@ def train():
             x_T = torch.randn((args.num_examples, args.crop_length, model.embedding_dim)).to(device)
             outputs = model(x_T).tolist()
             [print(text) for text in tokenizer.decode(outputs)]
+
+    wandb.finish()
 
 
 if __name__ == "__main__":
