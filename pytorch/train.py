@@ -2,7 +2,7 @@ import os
 import math
 import random
 import argparse
-from typing import List
+from typing import List, Tuple
 
 import wandb
 from tqdm import tqdm
@@ -12,6 +12,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from rotary_embedding_torch import RotaryEmbedding
+
+torch.set_float32_matmul_precision('high')
 
 
 def get_text(path: str) -> str:
@@ -26,7 +28,7 @@ def get_line_offsets(path: str, chunk_size: int = 2 ** 20) -> List[int]:
         while chunk:
             for line in chunk:
                 offsets.append(offsets[-1] + len(line))
-            print(f"Lines found: {len(offsets)}", end='\r')
+            print(f"Lines found: {len(offsets):,}", end='\r')
             chunk = file.readlines(chunk_size)
     return offsets
 
@@ -47,7 +49,7 @@ class SentencePieceTokenizer:
         return self.sp.pad_id()
 
     def encode(self, text):
-        return self.sp.encode(text, enable_sampling=True, alpha=0.1, nbest_size=2)
+        return self.sp.encode(text)
 
     def decode(self, encoded):
         return self.sp.decode(encoded)
@@ -71,27 +73,74 @@ class TextDataset(torch.utils.data.Dataset):
 
 
 class Collate:
-    def __init__(self, crop_length=-1, eos_id=-1, pad_id=-1, length_includes_pad=False):
+    def __init__(self, crop_length=-1, eos_id=-1, pad_id=-1, length_includes_pad=False, fold_size=None):
         assert not (pad_id < 0 and length_includes_pad)
+        assert not (pad_id < 0 and fold_size)
         self.crop_length = crop_length
+        self.fold_size = fold_size
         self.eos_id = eos_id
         self.pad_id = pad_id
+        self.pad_insert_rate = 0.0
         self.length_includes_pad = length_includes_pad
 
+    def fold(self, ids):
+        # pad the list for folding
+        remainder = len(ids) % self.fold_size
+        if remainder != 0:
+            ids += [self.pad_id] * (self.fold_size - remainder)
+        # fold the list
+        ids = [ids[i:i + self.fold_size] for i in range(0, len(ids), self.fold_size)]
+        return ids
+
+    def generate_mask(self, length):
+        conditional_mask = [False] * length
+        mask_span_length = random.randint(0, length - 1)
+        start_index = random.randint(0, length - mask_span_length)
+        conditional_mask[start_index:start_index + mask_span_length] = [True] * mask_span_length
+        # half of the masks will be completely random
+        if random.random() < 0.5:
+            random.shuffle(conditional_mask)
+        return conditional_mask
+
+    def process_ids(self, ids):
+        # and the eos token
+        if self.eos_id >= 0:
+            ids.append(self.eos_id)
+        # randomly insert pads into ids
+        if self.pad_id >= 0 and self.pad_insert_rate > 0:
+            pad_count = int(len(ids) * self.pad_insert_rate)
+            pad_indices = random.sample(range(len(ids)), pad_count)
+            for index in pad_indices:
+                ids.insert(index, self.pad_id)
+        if self.fold_size is not None:
+            ids = self.fold(ids)
+        # crops the length
+        if 0 < self.crop_length < len(ids):
+            ids = ids[:self.crop_length]
+        # create a conditional mask
+        conditional_mask = self.generate_mask(len(ids))
+        return ids, len(ids), conditional_mask
+
     def __call__(self, batch):
-        ids_end = [self.eos_id] if self.eos_id >= 0 else []
-        ids_list = [torch.tensor(ids + ids_end, dtype=torch.int64) for ids in batch]
-        ids = torch.nn.utils.rnn.pad_sequence(ids_list, batch_first=True, padding_value=self.pad_id)
-        lengths = torch.tensor([x.shape[0] for x in ids_list])
+        processed = list(map(self.process_ids, batch))
+        ids, lengths, conditional_mask = zip(*processed)
 
-        if 0 < self.crop_length < ids.shape[1]:
-            ids = ids[:, :self.crop_length]
-            lengths = torch.minimum(lengths, torch.tensor(self.crop_length))
+        # sample a random amount of padding
+        padded_lengths = [random.randint(length, max(lengths)) for length in lengths]
+        lengths = torch.tensor(padded_lengths) if self.length_includes_pad else torch.tensor(lengths)
 
-        if self.length_includes_pad:
-            lengths = torch.full_like(lengths, lengths.max())
+        ids = torch.nn.utils.rnn.pad_sequence(
+            [torch.tensor(x, dtype=torch.int64) for x in ids],
+            batch_first=True,
+            padding_value=self.pad_id
+        )
+        conditional_mask = torch.nn.utils.rnn.pad_sequence(
+            [torch.tensor(x, dtype=torch.bool) for x in conditional_mask],
+            batch_first=True,
+            padding_value=False
+        )
 
-        return ids, lengths
+        return ids, lengths, conditional_mask
 
 
 class MultiHeadAttention(nn.Module):
@@ -119,10 +168,13 @@ class MultiHeadAttention(nn.Module):
         v = v.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
 
         if self.rotary_emb is not None:
-            q = self.rotary_emb.rotate_queries_or_keys(q, seq_dim=2)
-            k = self.rotary_emb.rotate_queries_or_keys(k, seq_dim=2)
+            q = self.rotary_emb.rotate_queries_or_keys(q, seq_dim=-2)
+            k = self.rotary_emb.rotate_queries_or_keys(k, seq_dim=-2)
 
-        score = (q @ k.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        # with torch.backends.cuda.sdp_kernel(enable_flash=True):
+        #     out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.1 if self.training else 0.0)
+
+        score = (q @ k.transpose(-2, -1)) * 1.0 / math.sqrt(self.head_dim)
         if mask is not None:
             score = score.masked_fill(mask == 0, -1e9)
         score = F.softmax(score, dim=-1)
@@ -133,17 +185,17 @@ class MultiHeadAttention(nn.Module):
 
 
 class TransformerEncoderLayer(nn.Module):
-    def __init__(self, dim, hidden_dim, num_heads=8, drop_prob=0.0):
+    def __init__(self, dim, hidden_dim, num_heads=8, drop_prob=0.0, elementwise_affine=True):
         super(TransformerEncoderLayer, self).__init__()
-        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)
+        self.norm1 = nn.LayerNorm(dim, elementwise_affine=elementwise_affine)
         self.attention = MultiHeadAttention(
             dim=dim,
             num_heads=num_heads,
-            qkv_bias=False,
-            rotary_embedding=RotaryEmbedding(dim=dim // (num_heads * 2))
+            qkv_bias=True,
+            rotary_embedding=RotaryEmbedding(dim=dim // num_heads)
         )
         self.dropout1 = nn.Dropout(p=drop_prob)
-        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
+        self.norm2 = nn.LayerNorm(dim, elementwise_affine=elementwise_affine)
         self.ffn = nn.Sequential(
             nn.Linear(dim, hidden_dim),
             nn.GELU(),
@@ -151,18 +203,16 @@ class TransformerEncoderLayer(nn.Module):
         )
         self.dropout2 = nn.Dropout(p=drop_prob)
 
-    def forward(self, x, mask, gammas=(0.0, 0.0), betas=(0.0, 0.0)):
-        res1 = x
+    def forward(self, x, mask):
+        res = x
         x = self.norm1(x)
-        x = (gammas[0] * x) + betas[0]
         x = self.attention(q=x, k=x, v=x, mask=mask)
-        x = res1 + self.dropout1(x)
+        x = res + self.dropout1(x)
 
-        res2 = x
+        res = x
         x = self.norm2(x)
-        x = (gammas[1] * x) + betas[1]
         x = self.ffn(x)
-        x = res2 + self.dropout2(x)
+        x = res + self.dropout2(x)
         return x
 
 
@@ -170,12 +220,11 @@ class LearnedSinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
         super(LearnedSinusoidalPosEmb, self).__init__()
         assert (dim % 2) == 0
-        half_dim = dim // 2
-        self.weights = nn.Parameter(torch.randn(half_dim))
+        self.weights = nn.Parameter(torch.randn(dim // 2))
 
     def forward(self, x):
-        freq = torch.einsum('b,d->bd', x, self.weights) * 2 * math.pi
-        return torch.cat([freq.sin(), freq.cos()], dim=-1)
+        freq = torch.einsum('bl,d->bld', x, self.weights) * 2 * math.pi
+        return torch.cat([x.unsqueeze(-1), freq.sin(), freq.cos()], dim=-1)
 
 
 class TransformerModel(nn.Module):
@@ -188,16 +237,18 @@ class TransformerModel(nn.Module):
 
         self.time_mlp = nn.Sequential(
             LearnedSinusoidalPosEmb(learned_sinusoidal_dim),
-            nn.Linear(learned_sinusoidal_dim, 128),
+            nn.Linear(learned_sinusoidal_dim + 1, 128),
             nn.GELU(),
             nn.Dropout(p=dropout_prob),
-            nn.Linear(128, num_layers * 4 * model_dim),
-            nn.GELU(),
+            nn.Linear(128, model_dim),
         )
 
         self.project = nn.Sequential(
             nn.Linear(input_dim, model_dim),
-            nn.Dropout(p=dropout_prob)
+            nn.LayerNorm(model_dim),
+            nn.GELU(),
+            nn.Dropout(p=dropout_prob),
+            nn.Linear(model_dim, model_dim)
         )
 
         self.encoder_layers = nn.ModuleList(
@@ -205,34 +256,47 @@ class TransformerModel(nn.Module):
                 dim=model_dim,
                 hidden_dim=4 * model_dim,
                 num_heads=8,
-                drop_prob=dropout_prob
+                drop_prob=dropout_prob,
+                elementwise_affine=True
             )
             for _ in range(num_layers))
 
-        self.out = nn.Linear(model_dim, target_dim)
+        self.out = nn.Sequential(
+            nn.Linear(model_dim, model_dim),
+            nn.LayerNorm(model_dim),
+            nn.GELU(),
+            nn.Dropout(p=dropout_prob),
+            nn.Linear(model_dim, target_dim)
+        )
+
+    @staticmethod
+    def self_attention_mask(length_mask):
+        return torch.logical_and(length_mask.unsqueeze(1).unsqueeze(1), length_mask.unsqueeze(1).unsqueeze(-1))
 
     def forward(self, x, t, length_mask=None):
-        time_emb = self.time_mlp(t)
-        x = self.project(x)
+        batch_size, seq_length, _ = x.size()
+        x = self.project(x) + self.time_mlp(t)
 
         if length_mask is not None:
             x = x * length_mask.unsqueeze(-1)
-            length_mask = length_mask.unsqueeze(1).unsqueeze(1)
+            attention_mask = self.self_attention_mask(length_mask)
+        else:
+            attention_mask = None
 
-        scaling_weights = time_emb.view(-1, self.num_layers * 4, self.model_dim).split(1, dim=1)
         for i, layer in enumerate(self.encoder_layers):
             if self.training and random.uniform(0, 1) < self.layerdrop_prob:
                 continue
-            gammas = scaling_weights[4 * i], scaling_weights[4 * i + 1]
-            betas = scaling_weights[4 * i + 2], scaling_weights[4 * i + 3]
-            x = layer(x, length_mask, gammas=gammas, betas=betas)
+            x = layer(x, attention_mask)
 
-        return self.out(x)
+        if length_mask is not None:
+            x = x * length_mask.unsqueeze(-1)
+
+        return self.out(x), x
 
 
 class ScoreDiffusion:
-    def __init__(self, score_model, interpolate=None, masking=None, sigma_min=0.1, sigma_max=100.0, sigma_data=1.0,
-                 rho=7.0):
+    def __init__(self, score_model, interpolate=None, masking=None, sigma_min=1.0, sigma_max=10.0, sigma_data=1.0,
+                 rho=1.0):
         super(ScoreDiffusion).__init__()
         self.score_model = score_model
         self.interpolate = interpolate
@@ -244,7 +308,7 @@ class ScoreDiffusion:
         self.rho = rho
 
     def rho_schedule(self, u):
-        # u [0,1]
+        # u [0,1], linear schedule when rho is 1.0
         rho_inv = 1.0 / self.rho
         sigma_max_pow_rho_inv = self.sigma_max ** rho_inv
         sigmas = (sigma_max_pow_rho_inv + u * (self.sigma_min ** rho_inv - sigma_max_pow_rho_inv)) ** self.rho
@@ -263,55 +327,77 @@ class ScoreDiffusion:
         return c_skip, c_out, c_in
 
     def loss_weight(self, sigma):
-        return (sigma ** 2.0 + self.sigma_data ** 2.0) * torch.rsqrt(sigma * self.sigma_data)
+        return (sigma ** 2.0 + self.sigma_data ** 2.0) / (sigma * self.sigma_data) ** 2.0
 
     def denoise(self, model, x_t, sigmas, **model_kwargs):
         c_skip, c_out, c_in = self.get_scaling(sigmas)
-        rescaled_t = 0.25 * torch.log(sigmas + 1e-44)
-        model_output = model(c_in.view(-1, 1, 1) * x_t, rescaled_t, **model_kwargs)
-        denoised = c_out.view(-1, 1, 1) * model_output + c_skip.view(-1, 1, 1) * x_t
-        return model_output, denoised
+        rescaled_t = 0.25 * torch.log(sigmas + 1e-3)
+        model_output, latent = model(c_in.unsqueeze(-1) * x_t, rescaled_t, **model_kwargs)
+        denoised = c_out.unsqueeze(-1) * model_output + c_skip.unsqueeze(-1) * x_t.detach()
+        return model_output, denoised, latent
 
     def loss_t(self, x, t, **model_kwargs):
+        x_target = x.detach()
+
         z = torch.randn_like(x, device=x.device)
+        x_t = x + (z * t.unsqueeze(-1))
 
-        target_x = x
+        model_output, x_denoised, latent = self.denoise(self.score_model, x_t, t, **model_kwargs)
 
-        if self.masking is not None:
-            x = self.masking(x)
+        weights = self.loss_weight(t)
 
-        x_t = x + z * t.view(-1, 1, 1)
+        return ((x_denoised - x_target) ** 2.0).mean(-1), x_denoised, latent, weights
 
-        _, denoised_x = self.denoise(self.score_model, x_t, t.detach(), **model_kwargs)
-
-        snrs = self.get_snr(t)
-        weights = self.get_weights(snrs)
-
-        return ((denoised_x - target_x) ** 2.0).mean(-1) * weights.view(-1, 1), denoised_x, weights
-
-    def compute_loss(self, x, **model_kwargs):
-        rand_u = torch.rand((x.shape[0],), dtype=x.dtype, device=x.device, requires_grad=False)
-        t = self.rho_schedule(rand_u)
+    def compute_loss(self, x, conditional_mask, **model_kwargs):
+        u = torch.rand(x.size()[:2], dtype=x.dtype, device=x.device, requires_grad=False)
+        t = self.rho_schedule(u)
+        t = t.masked_fill(conditional_mask, 0.0)
 
         return self.loss_t(x, t, **model_kwargs)
 
     @torch.no_grad()
-    def forward_diffusion(self, x, ts, return_list=False):
+    def sample_euler(self, x, ts, return_list=False):
+        x_list = []
+        t = ts[0]
+
+        for i in range(len(ts) - 1):
+            _, denoised, latent = self.denoise(self.score_model, x, t)
+
+            if self.interpolate is not None:
+                denoised, logits = self.interpolate(latent)
+
+            t_next = ts[i + 1]
+            d = (x - denoised) / t.unsqueeze(-1)
+            dt = (t_next - t).unsqueeze(-1)
+            x = x + d * dt
+
+            if return_list:
+                x_list.append(x)
+
+            t = t_next
+
+        return x_list if return_list else logits
+
+    @torch.no_grad()
+    def sample_iterative(self, x, ts, return_list=False):
         x_list = []
 
-        _, x = self.denoise(self.score_model, x, ts[0].unsqueeze(0))
+        _, x, latent = self.denoise(self.score_model, x, ts[0].unsqueeze(0))
+
+        if self.interpolate is not None:
+            x, logits = self.interpolate(latent)
 
         if return_list:
             x_list.append(x)
 
         for t in ts[1:]:
-            if self.interpolate is not None:
-                x = self.interpolate(x)
-
-            t = t.unsqueeze(0)
+            t = t
             z = torch.randn_like(x)
-            x = x + t * z
-            _, x = self.denoise(self.score_model, x, t)
+            x = x + t.unsqueeze(-1) * z
+            _, x, latent = self.denoise(self.score_model, x, t)
+
+            if self.interpolate is not None:
+                x, logits = self.interpolate(latent)
 
             if return_list:
                 x_list.append(x)
@@ -320,7 +406,7 @@ class ScoreDiffusion:
 
 
 class DiffusionLM(nn.Module):
-    def __init__(self, num_embeddings=1000, embedding_dim=64, model_dim=512, num_layers=8, dropout_prob=0.2,
+    def __init__(self, num_embeddings=1000, embedding_dim=64, model_dim=512, num_layers=8, dropout_prob=0.1,
                  layerdrop_prob=0.0, loss_weights=(1.0, 1.0)):
         super(DiffusionLM, self).__init__()
         self.num_embeddings = num_embeddings
@@ -333,12 +419,9 @@ class DiffusionLM(nn.Module):
 
         self.embedding_grad_scale = 0.1
         self.interpolate_temperature = 1.0
+        self.label_smoothing = 0.0
 
-        self.embedding = nn.Embedding(
-            num_embeddings=self.num_embeddings,
-            embedding_dim=self.embedding_dim
-        )
-        nn.init.normal_(self.embedding.weight, std=0.1)
+        self.embedding = nn.Embedding(num_embeddings=self.num_embeddings, embedding_dim=self.embedding_dim)
 
         self.estimator = TransformerModel(
             input_dim=self.embedding_dim,
@@ -350,12 +433,29 @@ class DiffusionLM(nn.Module):
         )
         self.diffusion = ScoreDiffusion(
             score_model=self.estimator,
+            interpolate=self.interpolate,
         )
 
-        self.dropout = nn.Dropout(p=dropout_prob)
-        self.lm_head = nn.Linear(self.embedding_dim, self.num_embeddings)
+        self.lm_head = nn.Sequential(
+            nn.Linear(model_dim, model_dim),
+            nn.LayerNorm(model_dim),
+            nn.GELU(),
+            nn.Dropout(p=dropout_prob),
+            nn.Linear(model_dim, self.num_embeddings)
+        )
 
-        self.loss_ce = nn.CrossEntropyLoss(reduction='none')
+        self.loss_ce = nn.CrossEntropyLoss(reduction='none', label_smoothing=self.label_smoothing)
+
+        self.apply(self.initialise_weights)
+
+    @staticmethod
+    def initialise_weights(module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.001)
 
     def get_embeddings(self, ids):
         e = self.embedding(ids)
@@ -363,7 +463,6 @@ class DiffusionLM(nn.Module):
         return e
 
     def get_logits(self, x):
-        x = self.dropout(x)
         x = self.lm_head(x)
         return x
 
@@ -373,15 +472,16 @@ class DiffusionLM(nn.Module):
         e = self.embedding.weight
         e = F.normalize(e, dim=-1) * math.sqrt(self.embedding_dim)
         interpolated = torch.einsum('nle,ed->nld', weights, e)
-        return interpolated
+        return interpolated, logits
 
     def apply_mask(self, x):
         batch_size, seq_length, _ = x.size()
-        token_mask = torch.rand(batch_size, seq_length, 1, device=x.device) < 0.15
+        token_mask = torch.rand(batch_size, seq_length, 1, device=x.device) < self.mask_prob
         return torch.where(token_mask, torch.randn_like(x), x)
 
     def cosine_similarity(self, x):
         e = self.embedding.weight
+        e = self.norm(e)
         e = F.normalize(e, dim=-1)
         x = F.normalize(x, dim=-1)
         cossim = torch.einsum('nld,ed->nle', x, e)
@@ -390,39 +490,44 @@ class DiffusionLM(nn.Module):
     @torch.no_grad()
     def compute_anisotropy(self):
         num_pairs = (self.num_embeddings - 1) * self.num_embeddings
-        norm_embeddings = F.normalize(self.embedding.weight, dim=-1)
+        e = self.embedding.weight
+        norm_embeddings = F.normalize(e, dim=-1)
         return (torch.einsum('id,jd->ij', norm_embeddings, norm_embeddings).sum() - self.num_embeddings) / num_pairs
 
     def embedding_grad_norm(self):
         return torch.norm(self.embedding.weight.grad)
 
-    def compute_loss(self, ids, lengths):
+    def compute_loss(self, ids, lengths, conditional_mask):
         x = self.get_embeddings(ids)
         x = self.embedding_grad_scale * x + (1.0 - self.embedding_grad_scale) * x.detach()
 
-        len_mask = torch.arange(ids.shape[1], device=ids.device).unsqueeze(0) < lengths.unsqueeze(1)
-        num_elems = len_mask.sum()
+        length_mask = torch.arange(ids.shape[1], device=ids.device).unsqueeze(0) < lengths.unsqueeze(1)
+        diff_mask = torch.logical_and(length_mask, torch.logical_not(conditional_mask))
+        num_elems = diff_mask.sum()
 
-        loss_diff, denoised_x, weights = self.diffusion.compute_loss(x, length_mask=len_mask)
-        loss_diff = loss_diff[len_mask].mean(-1)
+        loss_diff, x_denoised, latent, _ = self.diffusion.compute_loss(x, conditional_mask, length_mask=length_mask)
 
-        logits = self.get_logits(denoised_x)
-        ids = ids.masked_fill(torch.logical_not(len_mask), -100)
-        loss_reconstruction = self.loss_ce(logits.transpose(2, 1), ids) * weights.view(-1, 1)
+        loss_diff = loss_diff * diff_mask
+
+        logits = self.get_logits(latent)
+        ids = ids.masked_fill(~diff_mask, -100)
+        loss_ce = self.loss_ce(logits.transpose(2, 1), ids)
 
         accuracy = (logits.argmax(dim=-1) == ids).float().sum() / num_elems
 
-        loss_diff = loss_diff.mean()
-        loss_reconstruction = loss_reconstruction.sum() / num_elems
-        loss = self.loss_weights[0] * loss_diff + self.loss_weights[1] * loss_reconstruction
+        loss_diff = loss_diff.sum() / num_elems
+        loss_ce_pred = loss_ce.sum() / num_elems
+        loss = self.loss_weights[0] * loss_diff + self.loss_weights[1] * loss_ce_pred
 
-        return loss, loss_diff, loss_reconstruction, accuracy
+        return loss, loss_diff, loss_ce_pred, accuracy
 
     @torch.no_grad()
-    def forward(self, z, num_steps=100):
-        ts = self.diffusion.rho_schedule(torch.arange(num_steps, device=z.device) / num_steps)
-        x = self.diffusion.forward_diffusion(z * ts[0], ts)
-        return self.get_logits(x).argmax(dim=-1)
+    def forward(self, z, num_steps=200):
+        u = torch.arange(num_steps, device=z.device).view(-1, 1, 1) / (num_steps - 1)
+        ts = self.diffusion.rho_schedule(u)
+        x = self.diffusion.sample_euler(z * ts[0], ts)
+        # x = self.diffusion.sample_iterative(z * ts[0], ts)
+        return x.argmax(dim=-1)
 
 
 def linear_decay_with_warmup(step, max_learning_rate, warmup_steps, hold_steps, decay_steps, min_learning_rate=1e-8):
@@ -439,13 +544,13 @@ def linear_decay_with_warmup(step, max_learning_rate, warmup_steps, hold_steps, 
 def train():
     parser = argparse.ArgumentParser()
     parser.add_argument('-ep', '--epochs', type=int, default=100)
-    parser.add_argument('-b', '--batch_size', type=int, default=32)
+    parser.add_argument('-b', '--batch_size', type=int, default=128)
     parser.add_argument('-lr', '--learning_rate', type=float, default=1e-4)
     parser.add_argument('-decs', '--decay_steps', type=int, default=800000)
-    parser.add_argument('-wd', '--weight_decay', type=float, default=1e-8)
-    parser.add_argument('-acc', '--accumulation_steps', type=int, default=2)
+    parser.add_argument('-wd', '--weight_decay', type=float, default=0.0)
+    parser.add_argument('-acc', '--accumulation_steps', type=int, default=1)
 
-    parser.add_argument('-edim', '--embedding_dim', type=int, default=64)
+    parser.add_argument('-edim', '--embedding_dim', type=int, default=128)
     parser.add_argument('-mdim', '--model_dim', type=int, default=512)
     parser.add_argument('-numl', '--num_layers', type=int, default=8)
     parser.add_argument('-do', '--dropout_prob', type=float, default=0.1)
@@ -473,7 +578,6 @@ def train():
         num_layers=args.num_layers,
         dropout_prob=args.dropout_prob,
         layerdrop_prob=args.layerdrop_prob,
-        loss_weights=(1.0, 0.1)
     )
     model.to(device)
 
@@ -504,14 +608,14 @@ def train():
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=2,
+        num_workers=4,
+        pin_memory=False,
         collate_fn=collate
     )
 
     optim = torch.optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
-        betas=(0.9, 0.99),
         weight_decay=args.weight_decay
     )
 
@@ -519,7 +623,7 @@ def train():
         optim.load_state_dict(checkpoint['optimizer_state_dict'])
 
     global_step = checkpoint.get('global_step', 0)
-    lr_lambda = lambda step: linear_decay_with_warmup(step, args.learning_rate, 2000, 0, args.decay_steps,
+    lr_lambda = lambda step: linear_decay_with_warmup(step, args.learning_rate, 2000, 100000, args.decay_steps,
                                                       args.learning_rate * 0.1)
 
     wandb.init(
@@ -531,7 +635,8 @@ def train():
             'num_layers': model.num_layers,
             'dropout_prob': model.dropout_prob,
             'layerdrop_prob': model.layerdrop_prob,
-            'loss_weights': model.loss_weights
+            'loss_weights': model.loss_weights,
+            'label_smoothing': model.label_smoothing
         }
     )
 
@@ -540,34 +645,30 @@ def train():
         pbar = tqdm(dataloader)
         pbar.set_description(f"epoch: {ep}")
 
-        for idx, (ids, lengths) in enumerate(pbar):
-            ids = ids.to(device)
-            lengths = lengths.to(device)
+        for idx, (ids, lengths, conditional_mask) in enumerate(pbar):
 
-            loss, loss_diff, loss_reconstruction, accuracy = model.compute_loss(ids, lengths)
+            ids, lengths, conditional_mask = ids.to(device), lengths.to(device), conditional_mask.to(device)
 
-            if torch.isfinite(loss):
-                (loss / args.accumulation_steps).backward()
-            else:
-                ValueError("Loss is not finite, backward pass not computed.")
+            loss, loss_diff, loss_ce, accuracy = model.compute_loss(ids, lengths, conditional_mask)
 
-            metrics = {
-                "loss": loss.item(),
-                "mse": loss_diff.item(),
-                "ce": loss_reconstruction.item(),
-                "accuracy": accuracy.item(),
-            }
-
-            pbar.set_postfix(metrics)
+            (loss / args.accumulation_steps).backward()
 
             if ((idx + 1) % args.accumulation_steps == 0) or (idx + 1 == len(dataloader)):
                 optim.param_groups[0]['lr'] = lr_lambda(global_step)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optim.step()
                 optim.zero_grad()
-                torch.cuda.empty_cache()
                 global_step += 1
 
+            metrics = {
+                "loss": loss.item(),
+                "mse": loss_diff.item(),
+                "ce": loss_ce.item(),
+                "accuracy": accuracy.item(),
+            }
+            pbar.set_postfix(metrics)
+
+            if ((idx + 1) % args.accumulation_steps * 10 == 0) or (idx + 1 == len(dataloader)):
                 metrics.update({"learning_rate": optim.param_groups[0]['lr']})
                 metrics.update({"anisotropy": model.compute_anisotropy().item()})
                 wandb.log(metrics, step=global_step)
