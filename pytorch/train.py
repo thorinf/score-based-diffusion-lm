@@ -168,13 +168,13 @@ class MultiHeadAttention(nn.Module):
         v = v.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
 
         if self.rotary_emb is not None:
-            q = self.rotary_emb.rotate_queries_or_keys(q, seq_dim=-2)
-            k = self.rotary_emb.rotate_queries_or_keys(k, seq_dim=-2)
+            q = self.rotary_emb.rotate_queries_or_keys(q)
+            k = self.rotary_emb.rotate_queries_or_keys(k)
 
         # with torch.backends.cuda.sdp_kernel(enable_flash=True):
         #     out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.1 if self.training else 0.0)
 
-        score = (q @ k.transpose(-2, -1)) * 1.0 / math.sqrt(self.head_dim)
+        score = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
         if mask is not None:
             score = score.masked_fill(mask == 0, -1e9)
         score = F.softmax(score, dim=-1)
@@ -192,7 +192,7 @@ class TransformerEncoderLayer(nn.Module):
             dim=dim,
             num_heads=num_heads,
             qkv_bias=True,
-            rotary_embedding=RotaryEmbedding(dim=dim // num_heads)
+            rotary_embedding=RotaryEmbedding(dim=int(dim / (num_heads * 2)))
         )
         self.dropout1 = nn.Dropout(p=drop_prob)
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=elementwise_affine)
@@ -228,8 +228,8 @@ class LearnedSinusoidalPosEmb(nn.Module):
 
 
 class TransformerModel(nn.Module):
-    def __init__(self, input_dim, target_dim, model_dim, num_layers=8, learned_sinusoidal_dim=128, dropout_prob=0.0,
-                 layerdrop_prob=0.0):
+    def __init__(self, input_dim, target_dim, model_dim, num_layers=8, num_heads=16, learned_sinusoidal_dim=128,
+                 dropout_prob=0.0, layerdrop_prob=0.0):
         super(TransformerModel, self).__init__()
         self.model_dim = model_dim
         self.num_layers = num_layers
@@ -245,7 +245,6 @@ class TransformerModel(nn.Module):
 
         self.project = nn.Sequential(
             nn.Linear(input_dim, model_dim),
-            nn.LayerNorm(model_dim),
             nn.GELU(),
             nn.Dropout(p=dropout_prob),
             nn.Linear(model_dim, model_dim)
@@ -255,7 +254,7 @@ class TransformerModel(nn.Module):
             TransformerEncoderLayer(
                 dim=model_dim,
                 hidden_dim=4 * model_dim,
-                num_heads=8,
+                num_heads=num_heads,
                 drop_prob=dropout_prob,
                 elementwise_affine=True
             )
@@ -406,8 +405,8 @@ class ScoreDiffusion:
 
 
 class DiffusionLM(nn.Module):
-    def __init__(self, num_embeddings=1000, embedding_dim=64, model_dim=512, num_layers=8, dropout_prob=0.1,
-                 layerdrop_prob=0.0, loss_weights=(1.0, 1.0)):
+    def __init__(self, num_embeddings=1000, embedding_dim=64, model_dim=1024, num_layers=8, num_heads=16,
+                 dropout_prob=0.1, layerdrop_prob=0.0, loss_weights=(1.0, 1.0)):
         super(DiffusionLM, self).__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
@@ -417,7 +416,7 @@ class DiffusionLM(nn.Module):
         self.layerdrop_prob = layerdrop_prob
         self.loss_weights = loss_weights
 
-        self.embedding_grad_scale = 0.1
+        self.embedding_grad_scale = 1.0
         self.interpolate_temperature = 1.0
         self.label_smoothing = 0.0
 
@@ -428,6 +427,7 @@ class DiffusionLM(nn.Module):
             target_dim=self.embedding_dim,
             model_dim=self.model_dim,
             num_layers=num_layers,
+            num_heads=num_heads,
             dropout_prob=dropout_prob,
             layerdrop_prob=layerdrop_prob
         )
@@ -438,7 +438,6 @@ class DiffusionLM(nn.Module):
 
         self.lm_head = nn.Sequential(
             nn.Linear(model_dim, model_dim),
-            nn.LayerNorm(model_dim),
             nn.GELU(),
             nn.Dropout(p=dropout_prob),
             nn.Linear(model_dim, self.num_embeddings)
@@ -541,18 +540,26 @@ def linear_decay_with_warmup(step, max_learning_rate, warmup_steps, hold_steps, 
         return max(max_learning_rate * scale, min_learning_rate)
 
 
+def cosine_decay_with_warmup(step, max_learning_rate, warmup_steps, decay_steps):
+    if step < warmup_steps:
+        return max_learning_rate * (step / warmup_steps)
+    step -= warmup_steps
+    return ((math.cos(step / decay_steps * math.pi) + 1) / 2) * max_learning_rate
+
+
 def train():
     parser = argparse.ArgumentParser()
     parser.add_argument('-ep', '--epochs', type=int, default=100)
     parser.add_argument('-b', '--batch_size', type=int, default=128)
     parser.add_argument('-lr', '--learning_rate', type=float, default=1e-4)
-    parser.add_argument('-decs', '--decay_steps', type=int, default=800000)
+    parser.add_argument('-decs', '--decay_steps', type=int, default=1e6)
     parser.add_argument('-wd', '--weight_decay', type=float, default=0.0)
     parser.add_argument('-acc', '--accumulation_steps', type=int, default=1)
 
     parser.add_argument('-edim', '--embedding_dim', type=int, default=128)
-    parser.add_argument('-mdim', '--model_dim', type=int, default=512)
+    parser.add_argument('-mdim', '--model_dim', type=int, default=1024)
     parser.add_argument('-numl', '--num_layers', type=int, default=8)
+    parser.add_argument('-numh', '--num_heads', type=int, default=8)
     parser.add_argument('-do', '--dropout_prob', type=float, default=0.1)
     parser.add_argument('-ld', '--layerdrop_prob', type=float, default=0.0)
 
@@ -623,8 +630,7 @@ def train():
         optim.load_state_dict(checkpoint['optimizer_state_dict'])
 
     global_step = checkpoint.get('global_step', 0)
-    lr_lambda = lambda step: linear_decay_with_warmup(step, args.learning_rate, 2000, 100000, args.decay_steps,
-                                                      args.learning_rate * 0.1)
+    lr_lambda = lambda step: cosine_decay_with_warmup(step, args.learning_rate, 10000, args.decay_steps)
 
     wandb.init(
         project="score-based-diffusion-lm",
