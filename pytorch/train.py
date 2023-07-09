@@ -375,7 +375,7 @@ class ScoreDiffusion:
 
             t = t_next
 
-        return x_list if return_list else logits
+        return x_list if return_list else x
 
     @torch.no_grad()
     def sample_iterative(self, x, ts, return_list=False):
@@ -473,14 +473,8 @@ class DiffusionLM(nn.Module):
         interpolated = torch.einsum('nle,ed->nld', weights, e)
         return interpolated, logits
 
-    def apply_mask(self, x):
-        batch_size, seq_length, _ = x.size()
-        token_mask = torch.rand(batch_size, seq_length, 1, device=x.device) < self.mask_prob
-        return torch.where(token_mask, torch.randn_like(x), x)
-
     def cosine_similarity(self, x):
         e = self.embedding.weight
-        e = self.norm(e)
         e = F.normalize(e, dim=-1)
         x = F.normalize(x, dim=-1)
         cossim = torch.einsum('nld,ed->nle', x, e)
@@ -521,12 +515,17 @@ class DiffusionLM(nn.Module):
         return loss, loss_diff, loss_ce_pred, accuracy
 
     @torch.no_grad()
-    def forward(self, z, num_steps=200):
+    def forward(self, z, num_steps=200, conditional_ids=None):
         u = torch.arange(num_steps, device=z.device).view(-1, 1, 1) / (num_steps - 1)
         ts = self.diffusion.rho_schedule(u)
         x = self.diffusion.sample_euler(z * ts[0], ts)
         # x = self.diffusion.sample_iterative(z * ts[0], ts)
-        return x.argmax(dim=-1)
+        cossim = self.cosine_similarity(x)
+        return cossim.argmax(dim=-1)
+
+
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 def linear_decay_with_warmup(step, max_learning_rate, warmup_steps, hold_steps, decay_steps, min_learning_rate=1e-8):
@@ -645,6 +644,11 @@ def train():
             'label_smoothing': model.label_smoothing
         }
     )
+    wandb.watch(model, log_freq=100)
+
+    num_params = count_parameters(model)
+    formatted_params = "{:,}".format(num_params)
+    print(f"Total number of parameters: {formatted_params}")
 
     for ep in range(0, args.epochs):
         model.train()
