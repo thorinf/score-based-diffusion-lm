@@ -355,11 +355,14 @@ class ScoreDiffusion:
         return self.loss_t(x, t, **model_kwargs)
 
     @torch.no_grad()
-    def sample_euler(self, x, ts, return_list=False):
+    def sample_euler(self, x, ts, conditional_mask=None, return_list=False):
         x_list = []
         t = ts[0]
 
         for i in range(len(ts)):
+            if conditional_mask is not None:
+                t = t.masked_fill(conditional_mask, 0.0)
+
             _, denoised, latent = self.denoise(self.score_model, x, t)
 
             if self.interpolate is not None:
@@ -368,7 +371,11 @@ class ScoreDiffusion:
             t_next = ts[i + 1] if i + 1 != len(ts) else 0.0
             d = (x - denoised) / t.unsqueeze(-1)
             dt = (t_next - t).unsqueeze(-1)
-            x = x + d * dt
+
+            if conditional_mask is not None:
+                x = x + (d * dt).masked_fill(conditional_mask.unsqueeze(-1), 0.0)
+            else:
+                x = x + (d * dt)
 
             if return_list:
                 x_list.append(x)
@@ -378,10 +385,14 @@ class ScoreDiffusion:
         return x_list if return_list else x
 
     @torch.no_grad()
-    def sample_iterative(self, x, ts, return_list=False):
+    def sample_iterative(self, x, ts, conditional_mask=None, return_list=False):
         x_list = []
+        t = ts[0]
 
-        _, x, latent = self.denoise(self.score_model, x, ts[0].unsqueeze(0))
+        if conditional_mask is not None:
+            t = t.masked_fill(conditional_mask, 0.0)
+
+        _, x, latent = self.denoise(self.score_model, x, t)
 
         if self.interpolate is not None:
             x, logits = self.interpolate(latent)
@@ -390,13 +401,20 @@ class ScoreDiffusion:
             x_list.append(x)
 
         for t in ts[1:]:
-            t = t
+            if conditional_mask is not None:
+                t = t.masked_fill(conditional_mask, 0.0)
+
             z = torch.randn_like(x)
             x = x + t.unsqueeze(-1) * z
-            _, x, latent = self.denoise(self.score_model, x, t)
+            _, denoised, latent = self.denoise(self.score_model, x, t)
 
             if self.interpolate is not None:
-                x, logits = self.interpolate(latent)
+                denoised, logits = self.interpolate(latent)
+
+            if conditional_mask is not None:
+                x = torch.where(conditional_mask.unsqueeze(-1), x, denoised)
+            else:
+                x = denoised
 
             if return_list:
                 x_list.append(x)
@@ -516,10 +534,16 @@ class DiffusionLM(nn.Module):
 
     @torch.no_grad()
     def forward(self, z, num_steps=200, conditional_ids=None):
+        ids = torch.zeros(z.shape[:2], dtype=torch.int64, device=z.device)
+        conditional_mask = torch.zeros(z.shape[:2], dtype=torch.bool, device=z.device)
+        for i, sublist in enumerate(conditional_ids):
+            ids[i, :len(sublist)] = torch.tensor(sublist)
+            conditional_mask[i, :len(sublist)] = True
+        z = torch.where(conditional_mask.unsqueeze(-1), self.get_embeddings(ids), z)
         u = torch.arange(num_steps, device=z.device).view(-1, 1, 1) / (num_steps - 1)
         ts = self.diffusion.rho_schedule(u)
-        x = self.diffusion.sample_euler(z * ts[0], ts)
-        # x = self.diffusion.sample_iterative(z * ts[0], ts)
+        # x = self.diffusion.sample_euler(z * ts[0], ts, conditional_mask)
+        x = self.diffusion.sample_iterative(z * ts[0], ts, conditional_mask)
         cossim = self.cosine_similarity(x)
         return cossim.argmax(dim=-1)
 
@@ -597,10 +621,18 @@ def train():
     if 'model_state_dict' in checkpoint:
         model.load_state_dict(checkpoint['model_state_dict'], strict=False)
 
+    conditional_starts = [
+        'this is a test',
+        'ounce upon a time',
+        'the king began thinking',
+        'many people questioned the decisions of'
+    ]
+    conditional_ids = tokenizer.encode(conditional_starts)
+
     model.eval()
     with torch.no_grad():
         x_T = torch.randn((args.num_examples, args.crop_length, model.embedding_dim)).to(device)
-        outputs = model(x_T).tolist()
+        outputs = model(x_T, conditional_ids=conditional_ids).tolist()
         [print(text) for text in tokenizer.decode(outputs)]
 
     dataset = TextDataset(path=args.data_path, tokenizer=tokenizer)
@@ -694,7 +726,7 @@ def train():
         model.eval()
         with torch.no_grad():
             x_T = torch.randn((args.num_examples, args.crop_length, model.embedding_dim)).to(device)
-            outputs = model(x_T).tolist()
+            outputs = model(x_T, conditional_ids=conditional_ids).tolist()
             [print(text) for text in tokenizer.decode(outputs)]
 
     wandb.finish()
