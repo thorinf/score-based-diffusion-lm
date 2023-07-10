@@ -356,12 +356,14 @@ class ScoreDiffusion:
 
     @torch.no_grad()
     def sample_euler(self, x, ts, conditional_mask=None, return_list=False):
+        if conditional_mask is None:
+            conditional_mask = torch.zeros_like(x, dtype=torch.bool)
+
         x_list = []
         t = ts[0]
 
         for i in range(len(ts)):
-            if conditional_mask is not None:
-                t = t.masked_fill(conditional_mask, 0.0)
+            t = t.masked_fill(conditional_mask, 0.0)
 
             _, denoised, latent = self.denoise(self.score_model, x, t)
 
@@ -371,11 +373,7 @@ class ScoreDiffusion:
             t_next = ts[i + 1] if i + 1 != len(ts) else 0.0
             d = (x - denoised) / t.unsqueeze(-1)
             dt = (t_next - t).unsqueeze(-1)
-
-            if conditional_mask is not None:
-                x = x + (d * dt).masked_fill(conditional_mask.unsqueeze(-1), 0.0)
-            else:
-                x = x + (d * dt)
+            x = x + (d * dt).masked_fill(conditional_mask.unsqueeze(-1), 0.0)
 
             if return_list:
                 x_list.append(x)
@@ -386,35 +384,24 @@ class ScoreDiffusion:
 
     @torch.no_grad()
     def sample_iterative(self, x, ts, conditional_mask=None, return_list=False):
-        x_list = []
-        t = ts[0]
+        if conditional_mask is None:
+            conditional_mask = torch.zeros_like(x, dtype=torch.bool)
 
-        if conditional_mask is not None:
+        x_list = []
+
+        for i, t in enumerate(ts):
             t = t.masked_fill(conditional_mask, 0.0)
 
-        _, x, latent = self.denoise(self.score_model, x, t)
+            if i != 0:
+                z = torch.randn_like(x)
+                x = x + t.unsqueeze(-1) * z
 
-        if self.interpolate is not None:
-            x, logits = self.interpolate(latent)
-
-        if return_list:
-            x_list.append(x)
-
-        for t in ts[1:]:
-            if conditional_mask is not None:
-                t = t.masked_fill(conditional_mask, 0.0)
-
-            z = torch.randn_like(x)
-            x = x + t.unsqueeze(-1) * z
-            _, denoised, latent = self.denoise(self.score_model, x, t)
+            _, x, latent = self.denoise(self.score_model, x, t)
 
             if self.interpolate is not None:
-                denoised, logits = self.interpolate(latent)
+                x, logits = self.interpolate(latent)
 
-            if conditional_mask is not None:
-                x = torch.where(conditional_mask.unsqueeze(-1), x, denoised)
-            else:
-                x = denoised
+            x = torch.where(conditional_mask.unsqueeze(-1), x, x)
 
             if return_list:
                 x_list.append(x)
