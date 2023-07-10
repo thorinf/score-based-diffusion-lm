@@ -359,13 +359,13 @@ class ScoreDiffusion:
         x_list = []
         t = ts[0]
 
-        for i in range(len(ts) - 1):
+        for i in range(len(ts)):
             _, denoised, latent = self.denoise(self.score_model, x, t)
 
             if self.interpolate is not None:
                 denoised, logits = self.interpolate(latent)
 
-            t_next = ts[i + 1]
+            t_next = ts[i + 1] if i + 1 != len(ts) else 0.0
             d = (x - denoised) / t.unsqueeze(-1)
             dt = (t_next - t).unsqueeze(-1)
             x = x + d * dt
