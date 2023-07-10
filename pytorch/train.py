@@ -566,6 +566,14 @@ def cosine_decay_with_warmup(step, max_learning_rate, warmup_steps, decay_steps)
     return decay_fraction * max_learning_rate
 
 
+@torch.no_grad()
+def eval_model(model, args, device, conditional_ids):
+    model.eval()
+    x_T = torch.randn((args.num_examples, args.crop_length, model.embedding_dim)).to(device)
+    outputs = model(x_T, conditional_ids=conditional_ids).tolist()
+    return outputs
+
+
 def train():
     parser = argparse.ArgumentParser()
     parser.add_argument('-ep', '--epochs', type=int, default=100)
@@ -625,11 +633,8 @@ def train():
     ]
     conditional_ids = tokenizer.encode(conditional_starts)
 
-    model.eval()
-    with torch.no_grad():
-        x_T = torch.randn((args.num_examples, args.crop_length, model.embedding_dim)).to(device)
-        outputs = model(x_T, conditional_ids=conditional_ids).tolist()
-        [print(text) for text in tokenizer.decode(outputs)]
+    outputs = eval_model(model, args, device, conditional_ids)
+    [print(text) for text in tokenizer.decode(outputs)]
 
     dataset = TextDataset(path=args.data_path, tokenizer=tokenizer)
     collate = Collate(
@@ -719,11 +724,8 @@ def train():
                 }
                 torch.save(checkpoint, args.checkpoint)
 
-        model.eval()
-        with torch.no_grad():
-            x_T = torch.randn((args.num_examples, args.crop_length, model.embedding_dim)).to(device)
-            outputs = model(x_T, conditional_ids=conditional_ids).tolist()
-            [print(text) for text in tokenizer.decode(outputs)]
+        outputs = eval_model(model, args, device, conditional_ids)
+        [print(text) for text in tokenizer.decode(outputs)]
 
     wandb.finish()
 
