@@ -522,16 +522,22 @@ class DiffusionLM(nn.Module):
     @torch.no_grad()
     def forward(self, z, num_steps=200, conditional_ids=None):
         ids = torch.zeros(z.shape[:2], dtype=torch.int64, device=z.device)
-        conditional_mask = torch.zeros(z.shape[:2], dtype=torch.bool, device=z.device)
+        conditional_mask = torch.zeros_like(ids, dtype=torch.bool)
+
         for i, sublist in enumerate(conditional_ids):
-            ids[i, :len(sublist)] = torch.tensor(sublist)
-            conditional_mask[i, :len(sublist)] = True
+            sublist_len = len(sublist)
+            ids[i, :sublist_len] = torch.tensor(sublist, device=z.device)
+            conditional_mask[i, :sublist_len] = True
+
         z = torch.where(conditional_mask.unsqueeze(-1), self.get_embeddings(ids), z)
+
         u = torch.arange(num_steps, device=z.device).view(-1, 1, 1) / (num_steps - 1)
         ts = self.diffusion.rho_schedule(u)
         # x = self.diffusion.sample_euler(z * ts[0], ts, conditional_mask)
         x = self.diffusion.sample_iterative(z * ts[0], ts, conditional_mask)
+
         cossim = self.cosine_similarity(x)
+
         return cossim.argmax(dim=-1)
 
 
@@ -540,21 +546,24 @@ def count_parameters(model):
 
 
 def linear_decay_with_warmup(step, max_learning_rate, warmup_steps, hold_steps, decay_steps, min_learning_rate=1e-8):
+    scaled_lr = max_learning_rate * (step / warmup_steps)
+
     if step < warmup_steps:
-        return max_learning_rate * (step / warmup_steps)
+        return scaled_lr
     elif step < warmup_steps + hold_steps:
         return max_learning_rate
     else:
         offset = warmup_steps + hold_steps
-        scale = 1 - (step - offset) / decay_steps
-        return max(max_learning_rate * scale, min_learning_rate)
+        return max(max_learning_rate * (1 - (step - offset) / decay_steps), min_learning_rate)
 
 
 def cosine_decay_with_warmup(step, max_learning_rate, warmup_steps, decay_steps):
     if step < warmup_steps:
-        return max_learning_rate * (step / warmup_steps)
+        return max_learning_rate * step / warmup_steps
+
     step -= warmup_steps
-    return ((math.cos(step / decay_steps * math.pi) + 1) / 2) * max_learning_rate
+    decay_fraction = (math.cos(step / decay_steps * math.pi) + 1) / 2
+    return decay_fraction * max_learning_rate
 
 
 def train():
