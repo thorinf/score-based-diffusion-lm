@@ -48,8 +48,9 @@ class TextDataset(torch.utils.data.Dataset):
 
 class Collate:
     def __init__(self, crop_length=-1, eos_id=-1, pad_id=-1, length_includes_pad=False, fold_size=None):
-        assert not (pad_id < 0 and length_includes_pad)
-        assert not (pad_id < 0 and fold_size)
+        if pad_id < 0:
+            assert not length_includes_pad, f"pad_id must be non-negative to include padding in length. Got {pad_id}."
+            assert not fold_size, f"pad_id must be non-negative to allow sequence folding. Got {pad_id}."
         self.crop_length = crop_length
         self.fold_size = fold_size
         self.eos_id = eos_id
@@ -58,20 +59,21 @@ class Collate:
         self.length_includes_pad = length_includes_pad
 
     def fold(self, ids):
-        # pad the list for folding
+        # Pad the list for folding
         remainder = len(ids) % self.fold_size
         if remainder != 0:
             ids += [self.pad_id] * (self.fold_size - remainder)
-        # fold the list
+        # Fold the list
         ids = [ids[i:i + self.fold_size] for i in range(0, len(ids), self.fold_size)]
         return ids
 
-    def generate_mask(self, length):
+    @staticmethod
+    def generate_mask(length):
         conditional_mask = [False] * length
         mask_span_length = random.randint(0, length - 1)
         start_index = random.randint(0, length - mask_span_length)
         conditional_mask[start_index:start_index + mask_span_length] = [True] * mask_span_length
-        # half of the masks will be completely random
+        # Half of the masks will be completely random
         if random.random() < 0.5:
             random.shuffle(conditional_mask)
         return conditional_mask
