@@ -8,7 +8,7 @@ from tqdm import tqdm
 
 from data import SentencePieceTokenizer, TextDataset, Collate
 from model import DiffusionLM
-from utils import count_parameters, cosine_decay_with_warmup
+from utils import count_parameters, update_model_ema, cosine_decay_with_warmup
 
 torch.set_float32_matmul_precision('high')
 
@@ -75,6 +75,21 @@ def train():
     num_params = count_parameters(model)
     print(f"Total number of parameters: {num_params:,}")
 
+    ema_model = DiffusionLM(
+        num_embeddings=len(tokenizer),
+        embedding_dim=args.embedding_dim,
+        model_dim=args.model_dim,
+        num_layers=args.num_layers,
+        dropout_prob=args.dropout_prob,
+        layerdrop_prob=args.layerdrop_prob,
+    )
+    ema_model.to(device)
+
+    if 'ema_model_state_dict' in checkpoint:
+        ema_model.load_state_dict(checkpoint['ema_model_state_dict'])
+    else:
+        ema_model.load_state_dict(model.state_dict())
+
     conditional_starts = [
         'this is a test',
         'once upon a time',
@@ -83,7 +98,7 @@ def train():
     ]
     conditional_ids = tokenizer.encode(conditional_starts)
 
-    output_ids = eval_model(model, args, device, conditional_ids)
+    output_ids = eval_model(ema_model, args, device, conditional_ids)
     decoded = tokenizer.decode(output_ids)
     [print(text) for text in decoded]
 
@@ -153,6 +168,7 @@ def train():
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 optim.step()
                 optim.zero_grad()
+                update_model_ema(model, ema_model, 0.95)
                 global_step += 1
 
             metrics = {
@@ -172,11 +188,12 @@ def train():
                 checkpoint = {
                     'global_step': global_step,
                     'model_state_dict': model.state_dict(),
+                    'ema_model_state_dict': ema_model.state_dict(),
                     'optimizer_state_dict': optim.state_dict()
                 }
                 torch.save(checkpoint, args.checkpoint)
 
-        output_ids = eval_model(model, args, device, conditional_ids)
+        output_ids = eval_model(ema_model, args, device, conditional_ids)
         decoded = tokenizer.decode(output_ids)
         [print(text) for text in decoded]
 
