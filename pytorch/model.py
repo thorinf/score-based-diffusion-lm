@@ -7,7 +7,8 @@ import torch.nn.functional as F
 
 from rotary_embedding_torch import RotaryEmbedding
 
-from diffusion import ScoreDiffusion
+from diffusion import MultiStepScoreDiffusion
+from utils import append_dims
 
 
 class MultiHeadAttention(nn.Module):
@@ -26,13 +27,13 @@ class MultiHeadAttention(nn.Module):
         self.rotary_emb = rotary_embedding
 
     def forward(self, q, k, v, mask=None):
-        batch_size, seq_length, _ = q.size()
+        bsz, slen, _ = q.shape
 
         q, k, v = self.w_q(q), self.w_k(k), self.w_v(v)
 
-        q = q.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(batch_size, seq_length, self.num_heads, self.head_dim).transpose(1, 2)
+        q = q.view(bsz, slen, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(bsz, slen, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(bsz, slen, self.num_heads, self.head_dim).transpose(1, 2)
 
         if self.rotary_emb is not None:
             q = self.rotary_emb.rotate_queries_or_keys(q)
@@ -47,7 +48,7 @@ class MultiHeadAttention(nn.Module):
         score = F.softmax(score, dim=-1)
         out = score @ v
 
-        out = out.transpose(1, 2).contiguous().view(batch_size, seq_length, self.model_dim)
+        out = out.transpose(1, 2).contiguous().view(bsz, slen, self.model_dim)
         return self.w_o(out)
 
 
@@ -87,11 +88,12 @@ class LearnedSinusoidalPosEmb(nn.Module):
     def __init__(self, dim):
         super(LearnedSinusoidalPosEmb, self).__init__()
         assert (dim % 2) == 0
-        self.weights = nn.Parameter(torch.randn(dim // 2))
+        half_dim = dim // 2
+        self.weights = nn.Parameter(torch.randn(half_dim))
 
     def forward(self, x):
-        freq = torch.einsum('bl,d->bld', x, self.weights) * 2 * math.pi
-        return torch.cat([x.unsqueeze(-1), freq.sin(), freq.cos()], dim=-1)
+        freq = x @ self.weights.unsqueeze(0) * 2 * math.pi
+        return torch.cat([x, freq.sin(), freq.cos()], dim=-1)
 
 
 class TransformerModel(nn.Module):
@@ -148,13 +150,13 @@ class TransformerModel(nn.Module):
         return torch.concat([mask_lower, mask_upper], dim=1)
 
     def forward(self, x, t, length_mask=None):
-        batch_size, seq_length, _ = x.size()
-        x = self.project(x) + self.time_mlp(t)
+        bsz, slen, _ = x.shape
+        x = self.project(x) + self.time_mlp(append_dims(t, x.ndim))
 
         if length_mask is None:
-            length_mask = torch.ones((batch_size, seq_length), dtype=torch.bool, device=x.device)
+            length_mask = torch.ones((bsz, slen), dtype=torch.bool, device=x.device)
 
-        x = x * length_mask.unsqueeze(-1)
+        x = x * append_dims(length_mask, x.ndim)
         attention_mask = self.mixed_masking(length_mask, self.num_heads)
 
         for i, layer in enumerate(self.encoder_layers):
@@ -162,8 +164,7 @@ class TransformerModel(nn.Module):
                 continue
             x = layer(x, attention_mask)
 
-        if length_mask is not None:
-            x = x * length_mask.unsqueeze(-1)
+        x = x * append_dims(length_mask, x.ndim)
 
         return self.out(x), x
 
@@ -195,10 +196,7 @@ class DiffusionLM(nn.Module):
             dropout_prob=dropout_prob,
             layerdrop_prob=layerdrop_prob
         )
-        self.diffusion = ScoreDiffusion(
-            score_model=self.estimator,
-            interpolate=self.interpolate,
-        )
+        self.diffusion = MultiStepScoreDiffusion(sigma_min=1.0, sigma_max=10.0, sigma_data=1.0, rho=1.0)
 
         self.lm_head = nn.Sequential(
             nn.Linear(model_dim, model_dim),
@@ -264,7 +262,12 @@ class DiffusionLM(nn.Module):
         diff_mask = torch.logical_and(length_mask, torch.logical_not(conditional_mask))
         num_elems = diff_mask.sum()
 
-        loss_diff, _, latent, weights = self.diffusion.compute_loss(x, conditional_mask, length_mask=length_mask)
+        loss_diff, _, latent, weights = self.diffusion.compute_loss(
+            model=self.estimator,
+            x_target=x,
+            conditional_mask=conditional_mask,
+            length_mask=length_mask
+        )
 
         weights = weights.masked_fill(~diff_mask, 0.0)
 
@@ -294,11 +297,27 @@ class DiffusionLM(nn.Module):
             ids[i, :sublist_len] = torch.tensor(sublist, device=z.device)
             conditional_mask[i, :sublist_len] = True
 
-        z = torch.where(conditional_mask.unsqueeze(-1), self.get_embeddings(ids), z)
+        # Set the conditional embeddings to be the true embeddings
+        z = torch.where(append_dims(conditional_mask, z.ndim), self.get_embeddings(ids), z)
 
-        u = torch.arange(num_steps, device=z.device).view(-1, 1, 1) / (num_steps - 1)
+        u = torch.arange(num_steps, device=z.device) / (num_steps - 1)
+        u = append_dims(u, z.ndim)
         ts = self.diffusion.rho_schedule(u)
-        logits = self.diffusion.sample_euler(z * ts[0], ts, conditional_mask)
-        # logits = self.diffusion.sample_iterative(z * ts[0], ts, conditional_mask)
+
+        # logits = self.diffusion.sample_euler(
+        #     model=self.estimator,
+        #     x_start=z * ts[0],
+        #     ts=ts,
+        #     conditional_mask=conditional_mask,
+        #     interpolate=self.interpolate
+        # )
+
+        logits = self.diffusion.sample_iterative(
+            model=self.estimator,
+            x_start=z * ts[0],
+            ts=ts,
+            conditional_mask=conditional_mask,
+            interpolate=self.interpolate
+        )
 
         return logits.argmax(dim=-1)
