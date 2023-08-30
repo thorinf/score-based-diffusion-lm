@@ -14,10 +14,10 @@ torch.set_float32_matmul_precision('high')
 
 
 @torch.no_grad()
-def eval_model(model, args, device, conditional_ids):
+def eval_model(model, args, device, conditional_ids=None, final_id=None):
     model.eval()
     x_T = torch.randn((args.num_examples, args.crop_length, model.embedding_dim)).to(device)
-    outputs = model(x_T, conditional_ids=conditional_ids).tolist()
+    outputs = model(x_T, conditional_ids=conditional_ids, final_id=final_id).tolist()
     return outputs
 
 
@@ -93,7 +93,7 @@ def train():
     conditional_starts = get_text("conditional_starts.txt")
     conditional_ids = tokenizer.encode(conditional_starts)
 
-    output_ids = eval_model(ema_model, args, device, conditional_ids)
+    output_ids = eval_model(ema_model, args, device, conditional_ids, tokenizer.eos_id)
     decoded = tokenizer.decode(output_ids)
     [print(text) for text in decoded]
 

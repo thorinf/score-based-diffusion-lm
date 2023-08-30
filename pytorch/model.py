@@ -288,14 +288,19 @@ class DiffusionLM(nn.Module):
         return loss, loss_diff, loss_ce_pred, accuracy
 
     @torch.no_grad()
-    def forward(self, z, num_steps=200, conditional_ids=None):
+    def forward(self, z, num_steps=200, conditional_ids=None, final_id=None):
         ids = torch.zeros(z.shape[:2], dtype=torch.int64, device=z.device)
         conditional_mask = torch.zeros_like(ids, dtype=torch.bool)
 
-        for i, sublist in enumerate(conditional_ids):
-            sublist_len = len(sublist)
-            ids[i, :sublist_len] = torch.tensor(sublist, device=z.device)
-            conditional_mask[i, :sublist_len] = True
+        if conditional_ids is not None:
+            for i, sublist in enumerate(conditional_ids):
+                sublist_len = len(sublist)
+                ids[i, :sublist_len] = torch.tensor(sublist, device=z.device)
+                conditional_mask[i, :sublist_len] = True
+
+        if final_id is not None:
+            ids[:, -1] = final_id
+            conditional_mask[:, -1] = True
 
         # Set the conditional embeddings to be the true embeddings
         z = torch.where(append_dims(conditional_mask, z.ndim), self.get_embeddings(ids), z)
