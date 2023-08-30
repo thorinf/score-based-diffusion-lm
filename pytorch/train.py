@@ -8,7 +8,7 @@ from tqdm import tqdm
 
 from data import SentencePieceTokenizer, TextDataset, Collate
 from model import DiffusionLM
-from utils import count_parameters, update_model_ema, cosine_decay_with_warmup
+from utils import count_parameters, get_text, update_model_ema, cosine_decay_with_warmup
 
 torch.set_float32_matmul_precision('high')
 
@@ -90,12 +90,7 @@ def train():
     else:
         ema_model.load_state_dict(model.state_dict())
 
-    conditional_starts = [
-        'this is a test',
-        'once upon a time',
-        'the king began thinking',
-        'many people questioned the decisions of'
-    ]
+    conditional_starts = get_text("conditional_starts.txt")
     conditional_ids = tokenizer.encode(conditional_starts)
 
     output_ids = eval_model(ema_model, args, device, conditional_ids)
@@ -130,10 +125,6 @@ def train():
     global_step = checkpoint.get('global_step', 0)
     print(f"Number of completed training steps: {global_step}")
     lr_lambda = lambda step: cosine_decay_with_warmup(step, args.learning_rate, 10000, args.decay_steps)
-
-    num_params = count_parameters(model)
-    formatted_params = "{:,}".format(num_params)
-    print(f"Total number of parameters: {formatted_params}")
 
     wandb.init(
         project="score-based-diffusion-lm",

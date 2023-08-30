@@ -22,9 +22,9 @@ def update_model_ema(model: nn.Module, ema_model: nn.Module, mu: float = 0.95) -
         ema_weight.mul_(mu).add_(weight, alpha=1 - mu)
 
 
-def get_text(path: str) -> str:
+def get_text(path: str) -> List[str]:
     with open(path, "r", encoding='utf-8') as file:
-        return file.read()
+        return [line.strip() for line in file]
 
 
 def get_line_offsets(path: str, chunk_size: int = 2 ** 20) -> List[int]:
