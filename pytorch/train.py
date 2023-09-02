@@ -180,13 +180,15 @@ def train():
             elapsed_iters += 1
             elapsed_tokens += length_mask.sum().item()
 
-            if ((idx + 1) % args.accumulation_steps == 0) or (idx + 1 == len(dataloader)):
-                optim.param_groups[0]['lr'] = lr_lambda(global_step)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                optim.step()
-                optim.zero_grad()
-                update_model_ema(model, ema_model, args.ema_momentum)
-                global_step += 1
+            if ((idx + 1) % args.accumulation_steps != 0) and (idx + 1 != len(dataloader)):
+                continue
+
+            optim.param_groups[0]['lr'] = lr_lambda(global_step)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            optim.step()
+            optim.zero_grad()
+            update_model_ema(model, ema_model, args.ema_momentum)
+            global_step += 1
 
             if global_step % args.log_interval == 0 or (idx + 1 == len(dataloader)):
                 duration = time.time() - start_time
