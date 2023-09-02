@@ -54,7 +54,7 @@ spm.SentencePieceTrainer.train(
 The model can be trained with the command:
 
 ```commandline
-python train.py -d=TXT_CORPUS -spm=SPM_MODEL -ckpt=CHECKPOINTING_PATH
+python train.py -d=TXT_CORPUS -spm=SPM_MODEL -mdir=MODEL_DIRECTORY
 ```
 
 There's a bunch of other arguments which can be altered, but above is enough to get the model working.

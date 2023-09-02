@@ -254,11 +254,10 @@ class DiffusionLM(nn.Module):
     def embedding_grad_norm(self):
         return torch.norm(self.embedding.weight.grad)
 
-    def compute_loss(self, ids, lengths, conditional_mask):
+    def compute_loss(self, ids, length_mask, conditional_mask):
         x = self.get_embeddings(ids)
         x = self.embedding_grad_scale * x + (1.0 - self.embedding_grad_scale) * x.detach()
 
-        length_mask = torch.arange(ids.shape[1], device=ids.device).unsqueeze(0) < lengths.unsqueeze(1)
         diff_mask = torch.logical_and(length_mask, torch.logical_not(conditional_mask))
         num_elems = diff_mask.sum()
 

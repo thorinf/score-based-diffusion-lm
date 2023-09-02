@@ -34,7 +34,6 @@ def get_line_offsets(path: str, chunk_size: int = 2 ** 20) -> List[int]:
         while chunk:
             for line in chunk:
                 offsets.append(offsets[-1] + len(line))
-            print(f"Lines found: {len(offsets):,}", end='\r')
             chunk = file.readlines(chunk_size)
     return offsets
 
