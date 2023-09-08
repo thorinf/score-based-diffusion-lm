@@ -24,7 +24,6 @@ class Trainer:
             data,
             batch_size,
             accumulation_steps,
-            sequence_length,
             learning_rate,
             ema_rate,
             model_dir,
@@ -35,6 +34,7 @@ class Trainer:
             sample_conditioning,
             sample_iterations,
             resume_checkpoint,
+            warmup_steps=1e5,
             weight_decay=0.0,
             gradient_clipping=-1.0
     ):
@@ -44,7 +44,6 @@ class Trainer:
         self.data = data
         self.batch_size = batch_size
         self.accumulation_steps = accumulation_steps
-        self.sequence_length = sequence_length
         self.learning_rate = learning_rate
         self.ema_rate = [ema_rate] if isinstance(ema_rate, float) else [float(x) for x in ema_rate.split(",")]
         self.model_dir = model_dir
@@ -55,6 +54,7 @@ class Trainer:
         self.sample_conditioning = sample_conditioning
         self.sample_iterations = sample_iterations
         self.resume_checkpoint = resume_checkpoint
+        self.warmup_steps = warmup_steps
         self.weight_decay = weight_decay
         self.gradient_clipping = gradient_clipping
 
@@ -161,6 +161,7 @@ class Trainer:
         self.forward_backward()
         self.optimise()
         self.update_ema_parameters()
+        self.log_anisotropy()
         self.log_step()
 
     def forward_backward(self):
@@ -203,6 +204,42 @@ class Trainer:
         self.opt.step()
         self.global_step += 1
 
+    def scale_grads(self):
+        n_loss_elem = getattr(self, "n_loss_elem", self.accumulation_steps)
+        if hasattr(self, "n_loss_elem"):
+            setattr(self, "n_loss_elem", 0)
+
+        if n_loss_elem == 0:
+            logger.error("tried to optimize, but number of elements in loss was 0")
+            return False
+
+        if n_loss_elem > 1:
+            for param in self.model.parameters():
+                if param.grad is not None:
+                    param.grad.data.div_(n_loss_elem)
+
+    def grad_clip(self):
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clipping)
+
+    def log_grad_norm(self):
+        sq_sum = 0.0
+        for p in self.model.parameters():
+            if not p.requires_grad:
+                continue
+            sq_sum += (p.grad ** 2).sum().item()
+        logger.log_kv_mean("grad_norm", np.sqrt(sq_sum))
+
+    def update_lr(self):
+        lr = self.learning_rate * min(self.global_step / self.warmup_steps, 1.0)
+        self.opt.param_groups[0]['lr'] = lr
+        logger.log_kv("lr", lr)
+
+    def log_anisotropy(self):
+        logger.log_kv("anisotropy", compute_anisotropy(self.model.embedding.weight).item())
+
+    def log_step(self):
+        logger.log_kv("step", self.global_step)
+
     def prepare_conditioning(self):
         conditioning_ids = torch.zeros(self.sample_size, dtype=torch.int64, device=self.device)
         conditioning_mask = torch.zeros_like(conditioning_ids, dtype=torch.bool)
@@ -240,39 +277,3 @@ class Trainer:
         output_ids = torch.where(conditioning_mask, conditioning_ids, logits.argmax(-1)).cpu().tolist()
         decoded = self.tokenizer.decode(output_ids)
         [logger.info(f"sample {i}:\t{unidecode(text)}") for i, text in enumerate(decoded)]
-
-    def scale_grads(self):
-        n_loss_elem = getattr(self, "n_loss_elem", self.accumulation_steps)
-        if hasattr(self, "n_loss_elem"):
-            setattr(self, "n_loss_elem", 0)
-
-        if n_loss_elem == 0:
-            logger.error("tried to optimize, but number of elements in loss was 0")
-            return False
-
-        if n_loss_elem > 1:
-            for param in self.model.parameters():
-                if param.grad is not None:
-                    param.grad.data.div_(n_loss_elem)
-
-    def grad_clip(self):
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clipping)
-
-    def log_grad_norm(self):
-        sq_sum = 0.0
-        for p in self.model.parameters():
-            if not p.requires_grad:
-                continue
-            sq_sum += (p.grad ** 2).sum().item()
-        logger.log_kv_mean("grad_norm", np.sqrt(sq_sum))
-
-    def update_lr(self):
-        lr = self.learning_rate * min(self.global_step / 10000, 1.0)
-        self.opt.param_groups[0]['lr'] = lr
-        logger.log_kv("lr", lr)
-
-    def log_step(self):
-        logger.log_kv("step", self.global_step)
-
-    def log_anisotropy(self):
-        logger.log_kv("anisotropy", compute_anisotropy(self.model.embedding.weight).item())

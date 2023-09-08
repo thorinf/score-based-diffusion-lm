@@ -35,11 +35,12 @@ def main():
     )
 
     num_params = sum(p.numel() for p in model.parameters())
-    logger.log(f"total parameter count: {num_params}")
+    logger.log(f"total parameter count: {num_params:,}")
 
     wandb.init(
-        project=os.getenv("WANDB_PROJECT", "score_diffusion_lm"),
         name=args.model_dir,
+        project=os.getenv("WANDB_PROJECT", "score_diffusion_lm"),
+        dir=args.model_dir,
     )
     wandb.config.update(args.__dict__, allow_val_change=True)
 
@@ -68,15 +69,12 @@ def main():
 
     trainer = Trainer(
         model=model,
-        tokenizer=tokenizer,
         diffusion=diffusion,
+        tokenizer=tokenizer,
         data=dataloader,
         batch_size=args.batch_size,
-        sequence_length=args.sequence_length,
         accumulation_steps=args.accumulation_steps,
         learning_rate=args.learning_rate,
-        weight_decay=args.weight_decay,
-        gradient_clipping=args.gradient_clipping,
         ema_rate=args.ema_rate,
         model_dir=args.model_dir,
         log_interval=args.log_interval,
@@ -85,7 +83,10 @@ def main():
         sample_size=(args.num_examples, args.sequence_length),
         sample_conditioning=conditional_starts,
         sample_iterations=1000,
-        resume_checkpoint=True
+        resume_checkpoint=True,
+        warmup_steps=args.warmup_steps,
+        weight_decay=args.weight_decay,
+        gradient_clipping=args.gradient_clipping,
     )
     trainer.run_loop()
 
