@@ -51,54 +51,56 @@ class MultiStepScoreDiffusion:
             model: nn.Module,
             x_t: torch.Tensor,
             sigmas: torch.Tensor,
+            scale_output: bool = True,
             **model_kwargs: Any
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         c_skip, c_out, c_in = self.get_scaling(sigmas)
-        rescaled_t = 0.25 * torch.log(sigmas + 1e-3)
-        model_output, latent = model(append_dims(c_in, x_t.ndim) * x_t, rescaled_t, **model_kwargs)
-        denoised = append_dims(c_out, model_output.ndim) * model_output + append_dims(c_skip, x_t.ndim) * x_t.detach()
-        return model_output, denoised, latent
+        model_output = model(append_dims(c_in, x_t.ndim) * x_t, sigmas, **model_kwargs)
+        if not scale_output:
+            return model_output
+        return append_dims(c_out, model_output.ndim) * model_output + append_dims(c_skip, x_t.ndim) * x_t.detach()
 
-    def loss_t(
+    def score_loss(
             self,
             model: nn.Module,
             x_target: torch.Tensor,
-            t: torch.Tensor,
             **model_kwargs: Any
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        x_target, x = x_target.detach(), x_target
-
-        z = torch.randn_like(x, device=x.device)
-        x_t = x + (z * append_dims(t, z.ndim))
-
-        model_output, x_denoised, latent = self.denoise(model, x_t, t, **model_kwargs)
-
-        weights = self.loss_weight(t)
-
-        return ((x_denoised - x_target) ** 2.0).mean(-1), x_denoised, latent, weights
-
-    def compute_loss(
-            self,
-            model: nn.Module,
-            x_target: torch.Tensor,
-            conditional_mask: torch.Tensor = None,
-            **model_kwargs: Any
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        if conditional_mask is None:
-            conditional_mask = torch.zeros(x_target.shape[:2], dtype=torch.bool)
-        else:
-            assert conditional_mask.shape == x_target.shape[:2], \
-                f"Mask shape {conditional_mask.shape} mismatch with first 2 dimensions of x_target {x_target.shape}"
-
-        if random.uniform(0, 1) < 0.5:
-            u = torch.rand(x_target.size()[:2], dtype=x_target.dtype, device=x_target.device, requires_grad=False)
-        else:
-            u = torch.rand((x_target.shape[0], 1), dtype=x_target.dtype, device=x_target.device, requires_grad=False)
-
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        u_shape = x_target.shape[:1] if random.uniform(0, 1) < 0.5 else x_target.shape[:2]
+        u = torch.rand(u_shape, dtype=x_target.dtype, device=x_target.device, requires_grad=False)
         t = self.rho_schedule(u)
-        t = t.masked_fill(conditional_mask, 0.0)
 
-        return self.loss_t(model, x_target, t, **model_kwargs)
+        z = torch.randn_like(x_target, device=x_target.device)
+        x_t = x_target + (z * append_dims(t, z.ndim))
+
+        model_output = self.denoise(model, x_t, t, **model_kwargs)
+
+        weights = append_dims(self.loss_weight(t), x_target.ndim)
+        mse = weights * (x_target.detach() - model_output) ** 2.0
+
+        loss = mse.mean()
+
+        return loss
+
+    def ce_score_loss(
+            self,
+            model: nn.Module,
+            x_target: torch.Tensor,
+            ids_target: torch.Tensor,
+            **model_kwargs: Any
+    ) -> torch.Tensor:
+        u_shape = x_target.shape[:1] if random.uniform(0, 1) < 0.5 else x_target.shape[:2]
+        u = torch.rand(u_shape, dtype=x_target.dtype, device=x_target.device, requires_grad=False)
+        t = self.rho_schedule(u)
+
+        z = torch.randn_like(x_target, device=x_target.device)
+        x_t = x_target + (z * append_dims(t, z.ndim))
+
+        logits = self.denoise(model, x_t, t, False, **model_kwargs)
+
+        loss = torch.nn.functional.cross_entropy(logits.transpose(2, 1), ids_target)
+
+        return loss
 
     @torch.no_grad()
     def sample_euler(
@@ -106,40 +108,27 @@ class MultiStepScoreDiffusion:
             model: nn.Module,
             x_start: torch.Tensor,
             ts: torch.Tensor,
-            conditional_mask: torch.Tensor = None,
             interpolate: Callable = None,
-            return_all: bool = False
+            **model_kwargs: Any
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
-        if conditional_mask is None:
-            conditional_mask = torch.zeros(x_start.shape[:2], dtype=torch.bool)
-        else:
-            assert conditional_mask.shape == x_start.shape[:2], \
-                f"Mask shape {conditional_mask.shape} mismatch with first 2 dimensions of x_start {x_start.shape}"
-
         x = x_start
-        x_list = []
         t = ts[0]
         logits = None
 
         for i in range(len(ts)):
-            t = t.masked_fill(conditional_mask, 0.0)
-
-            _, denoised, latent = self.denoise(model, x, t)
+            denoised = self.denoise(model, x, t, interpolate is None, **model_kwargs)
 
             if interpolate is not None:
-                denoised, logits = interpolate(latent)
+                denoised, logits = interpolate(denoised), x
 
             t_next = ts[i + 1] if i + 1 != len(ts) else 0.0
             d = (x - denoised) / append_dims(t, x.ndim)
             dt = append_dims(t_next - t, d.ndim)
-            x = x + (d * dt).masked_fill(append_dims(conditional_mask, d.ndim), 0.0)
-
-            if return_all:
-                x_list.append(x)
+            x = x + (d * dt)
 
             t = t_next
 
-        return x_list if return_all else logits if interpolate else x
+        return logits if interpolate else x
 
     @torch.no_grad()
     def sample_iterative(
@@ -147,35 +136,20 @@ class MultiStepScoreDiffusion:
             model: nn.Module,
             x_start: torch.Tensor,
             ts: torch.Tensor,
-            conditional_mask: torch.Tensor = None,
             interpolate: Callable = None,
-            return_all: bool = False
+            **model_kwargs: Any
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
-        if conditional_mask is None:
-            conditional_mask = torch.zeros(x_start.shape[:2], dtype=torch.bool)
-        else:
-            assert conditional_mask.shape == x_start.shape[:2], \
-                f"Mask shape {conditional_mask.shape} mismatch with first 2 dimensions of x_start {x_start.shape}"
-
         x = x_start
-        x_list = []
         logits = None
 
         for i, t in enumerate(ts):
-            t = t.masked_fill(conditional_mask, 0.0)
-
             if i != 0:
                 z = torch.randn_like(x)
                 x = x + z * append_dims(t, z.ndim)
 
-            _, x, latent = self.denoise(model, x, t)
+            x = self.denoise(model, x, t, interpolate is None, **model_kwargs)
 
             if interpolate is not None:
-                x, logits = interpolate(latent)
+                x, logits = interpolate(x), x
 
-            x = torch.where(append_dims(conditional_mask, x.ndim), x, x)
-
-            if return_all:
-                x_list.append(x)
-
-        return x_list if return_all else logits if interpolate else x
+        return logits if interpolate else x
