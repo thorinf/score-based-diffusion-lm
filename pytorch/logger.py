@@ -3,7 +3,10 @@ Logger reimplemented from OpenAI baselines:
 https://github.com/openai/baselines/blob/ea25b9e8b234e6ee1bca43083f8f3cf974143998/baselines/logger.py
 """
 
+import os
 import sys
+import os.path as osp
+import json
 from collections import defaultdict
 import logging
 
@@ -59,7 +62,6 @@ class HumanOutputFormat(SeqWriter, KVWriter):
             return
 
         formatted_str = "\n".join(self._format_table(key2str, self.num_columns))
-        print(formatted_str)
         self.file.write(formatted_str + "\n")
         self.file.flush()
 
@@ -95,6 +97,20 @@ class HumanOutputFormat(SeqWriter, KVWriter):
         if self.own_file:
             self.file.close()
 
+
+class JSONOutputFormat(KVWriter):
+    def __init__(self, filename):
+        self.file = open(filename, "wt")
+
+    def writekvs(self, kvs):
+        for k, v in sorted(kvs.items()):
+            if hasattr(v, "dtype"):
+                kvs[k] = float(v)
+        self.file.write(json.dumps(kvs) + "\n")
+        self.file.flush()
+
+    def close(self):
+        self.file.close()
 
 class WandBOutputFormat(KVWriter):
     def __init__(self):
@@ -164,7 +180,7 @@ def configure_pylogging_handler():
 def configure(output_dir):
     output_formats = [
         HumanOutputFormat(sys.stdout),
-        HumanOutputFormat(f"{output_dir}/log.txt"),
+        HumanOutputFormat(osp.join(output_dir, "log.txt")),
         WandBOutputFormat()
     ]
 

@@ -127,3 +127,9 @@ class Collate:
         length_mask = torch.lt(torch.arange(ids.shape[1]).unsqueeze(0), lengths.unsqueeze(1))
 
         return ids, length_mask, conditioning_mask
+
+
+def infinite_loader(dataloader: torch.utils.data.DataLoader):
+    while True:
+        for batch in dataloader:
+            yield batch

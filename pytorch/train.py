@@ -1,7 +1,8 @@
 import argparse
 import os
 import logger
-from data import SentencePieceTokenizer, TextDataset
+from data import SentencePieceTokenizer, TextDataset, Collate, infinite_loader
+from torch.utils.data import DataLoader
 from model import ScoreLM
 from diffusion import MultiStepScoreDiffusion
 from trainer import Trainer
@@ -44,13 +45,32 @@ def main():
 
     dataset = TextDataset(path=args.data_path, tokenizer=tokenizer)
 
+    pad_sequence_value = tokenizer.pad_id if tokenizer.pad_id > 0 else tokenizer.eos_id
+    collate = Collate(
+        max_sequence_length=args.sequence_length,
+        pad_sequence_value=pad_sequence_value,
+        random_length_expansion=True,
+        insert_value=tokenizer.pad_id,
+        insert_rate=0.0
+    )
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=False,
+        collate_fn=collate
+    )
+    dataloader = infinite_loader(dataloader)
+
     conditional_starts = get_text("conditional_starts.txt")
 
     trainer = Trainer(
         model=model,
         tokenizer=tokenizer,
         diffusion=diffusion,
-        train_dataset=dataset,
+        data=dataloader,
         batch_size=args.batch_size,
         sequence_length=args.sequence_length,
         accumulation_steps=args.accumulation_steps,
@@ -62,13 +82,12 @@ def main():
         log_interval=args.log_interval,
         save_interval=args.save_interval,
         sample_interval=args.sample_interval,
-        sample_num_examples=args.num_examples,
+        sample_size=(args.num_examples, args.sequence_length),
         sample_conditioning=conditional_starts,
         sample_iterations=1000,
         resume_checkpoint=True
     )
-
-    trainer.run_training()
+    trainer.run_loop()
 
 
 def create_argparser():

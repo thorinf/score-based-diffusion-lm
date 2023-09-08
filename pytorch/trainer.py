@@ -1,12 +1,11 @@
 import os
+import os.path as osp
 import time
 
 import numpy as np
 import torch
-from torch.utils.data import DataLoader
 from unidecode import unidecode
 
-from data import Collate
 from utils import (
     get_named_float_tensors,
     get_weight_decay_parameters,
@@ -22,7 +21,7 @@ class Trainer:
             model,
             diffusion,
             tokenizer,
-            train_dataset,
+            data,
             batch_size,
             accumulation_steps,
             sequence_length,
@@ -32,7 +31,7 @@ class Trainer:
             log_interval,
             save_interval,
             sample_interval,
-            sample_num_examples,
+            sample_size,
             sample_conditioning,
             sample_iterations,
             resume_checkpoint,
@@ -42,7 +41,7 @@ class Trainer:
         self.model = model
         self.diffusion = diffusion
         self.tokenizer = tokenizer
-        self.train_dataset = train_dataset
+        self.data = data
         self.batch_size = batch_size
         self.accumulation_steps = accumulation_steps
         self.sequence_length = sequence_length
@@ -52,7 +51,7 @@ class Trainer:
         self.log_interval = log_interval
         self.save_interval = save_interval
         self.sample_interval = sample_interval
-        self.sample_num_examples = sample_num_examples
+        self.sample_size = sample_size
         self.sample_conditioning = sample_conditioning
         self.sample_iterations = sample_iterations
         self.resume_checkpoint = resume_checkpoint
@@ -76,7 +75,6 @@ class Trainer:
         self.opt = torch.optim.AdamW(
             optim_groups,
             lr=self.learning_rate,
-            weight_decay=self.weight_decay,
             betas=(0.9, 0.98)
         )
         self.load_optim_checkpoint()
@@ -84,22 +82,16 @@ class Trainer:
         self.ema_named_tensors = []
         self.load_ema_checkpoints()
 
-        self.loss_elem_since_optim = None
-        self.iters_since_log = 0
-        self.prev_log_time = time.time()
-        self.loss_iter = 0
-        self.accuracy_iter = 0
-
     def load_model_checkpoint(self):
-        checkpoint_path = os.path.join(self.model_dir, "model.pt")
-        if os.path.exists(checkpoint_path):
+        checkpoint_path = osp.join(self.model_dir, "model.pt")
+        if osp.exists(checkpoint_path):
             logger.info(f"loading checkpoint from {checkpoint_path}")
             model_state_dict = torch.load(checkpoint_path)
             self.model.load_state_dict(model_state_dict, strict=False)
 
     def load_optim_checkpoint(self):
-        checkpoint_path = os.path.join(self.model_dir, "optim.pt")
-        if os.path.exists(checkpoint_path):
+        checkpoint_path = osp.join(self.model_dir, "optim.pt")
+        if osp.exists(checkpoint_path):
             logger.info(f"loading checkpoint from {checkpoint_path}")
             optim_state_dict = torch.load(checkpoint_path)
             self.global_step = optim_state_dict.pop('global_step', self.global_step)
@@ -108,8 +100,8 @@ class Trainer:
     def load_ema_checkpoints(self):
         all_named_tensors = get_named_float_tensors(self.model, include_buffers=True)
         for rate in self.ema_rate:
-            ema_checkpoint_path = os.path.join(self.model_dir, f"ema_{rate}.pt")
-            if os.path.exists(ema_checkpoint_path):
+            ema_checkpoint_path = osp.join(self.model_dir, f"ema_{rate}.pt")
+            if osp.exists(ema_checkpoint_path):
                 logger.info(f"loading EMA checkpoint: {ema_checkpoint_path}")
                 ema_state_dict = torch.load(ema_checkpoint_path)
                 # Update or get tensors from the EMA state dict using model tensors names
@@ -125,18 +117,18 @@ class Trainer:
             ema_state_dict = self.model.state_dict()
             for name, tensor in ema_named_tensors:
                 ema_state_dict[name] = tensor
-            checkpoint_path = os.path.join(self.model_dir, f"ema_{rate}.pt")
+            checkpoint_path = osp.join(self.model_dir, f"ema_{rate}.pt")
             logger.info(f"saving checkpoint: {checkpoint_path}")
             torch.save(ema_state_dict, checkpoint_path)
 
         model_state_dict = self.model.state_dict()
-        checkpoint_path = os.path.join(self.model_dir, "model.pt")
+        checkpoint_path = osp.join(self.model_dir, "model.pt")
         logger.info(f"saving checkpoint: {checkpoint_path}")
         torch.save(model_state_dict, checkpoint_path)
 
         optim_state_dict = self.opt.state_dict()
         optim_state_dict['global_step'] = self.global_step
-        checkpoint_path = os.path.join(self.model_dir, "optim.pt")
+        checkpoint_path = osp.join(self.model_dir, "optim.pt")
         logger.info(f"saving checkpoint: {checkpoint_path}")
         torch.save(optim_state_dict, checkpoint_path)
 
@@ -152,9 +144,67 @@ class Trainer:
 
             update_ema_parameters(ema_model_parameters, model_parameters, rate)
 
+    def run_loop(self):
+        logger.info(f"training loop started...")
+        while True:
+            self.run_step()
+            if self.global_step % self.log_interval == 0:
+                logger.dump_kvs()
+            if self.global_step % self.save_interval == 0:
+                self.save()
+            if self.global_step % self.sample_interval == 0:
+                self.sample()
+            if self.max_updates is not None and self.global_step >= self.max_updates:
+                break
+
+    def run_step(self):
+        self.forward_backward()
+        self.optimise()
+        self.update_ema_parameters()
+        self.log_step()
+
+    def forward_backward(self):
+        self.opt.zero_grad()
+        for _ in range(self.accumulation_steps):
+            ids, length_mask, conditioning_mask = next(self.data)
+
+            ids = ids.to(self.device)
+            length_mask = length_mask.to(self.device)
+            conditioning_mask = conditioning_mask.to(self.device)
+
+            embeddings = self.model.get_embeddings(ids)
+            loss_mask = torch.logical_and(length_mask, ~conditioning_mask)
+            ids = ids.masked_fill(~loss_mask, -100)
+
+            ce_loss = self.diffusion.ce_score_loss(
+                model=self.model,
+                x_target=embeddings,
+                ids_target=ids,
+                length_mask=length_mask,
+                conditioning=embeddings,
+                conditioning_mask=conditioning_mask
+            )
+            loss = ce_loss
+            loss.backward()
+
+            logger.log_kv_mean("training_loss", loss.item(), loss_mask.sum().item())
+            logger.log_kv_mean("ce_loss", ce_loss.item(), loss_mask.sum().item())
+
+            n_token, n_mask = length_mask.sum().item(), conditioning_mask.sum().item()
+            logger.log_kv_mean("n_token", n_token)
+            logger.log_kv_mean("p_mask", n_mask / n_token, n_token)
+
+    def optimise(self):
+        self.scale_grads()
+        self.log_grad_norm()
+        self.update_lr()
+        if self.gradient_clipping > 0:
+            self.grad_clip()
+        self.opt.step()
+        self.global_step += 1
+
     def prepare_conditioning(self):
-        size = (self.sample_num_examples, self.sequence_length)
-        conditioning_ids = torch.zeros(size, dtype=torch.int64, device=self.device)
+        conditioning_ids = torch.zeros(self.sample_size, dtype=torch.int64, device=self.device)
         conditioning_mask = torch.zeros_like(conditioning_ids, dtype=torch.bool)
 
         if self.sample_conditioning:
@@ -191,106 +241,19 @@ class Trainer:
         decoded = self.tokenizer.decode(output_ids)
         [logger.info(f"sample {i}:\t{unidecode(text)}") for i, text in enumerate(decoded)]
 
-    def optimise(self):
-        # Determine the number of elements that contributed to the loss
-        loss_elem = self.loss_elem_since_optim if self.loss_elem_since_optim is not None else self.accumulation_steps
+    def scale_grads(self):
+        n_loss_elem = getattr(self, "n_loss_elem", self.accumulation_steps)
+        if hasattr(self, "n_loss_elem"):
+            setattr(self, "n_loss_elem", 0)
 
-        # Reset loss_elem_since_optim to 0 only if it was not None
-        if self.loss_elem_since_optim is not None:
-            self.loss_elem_since_optim = 0
-
-        # Check for invalid number of elements in loss
-        if loss_elem == 0:
+        if n_loss_elem == 0:
             logger.error("tried to optimize, but number of elements in loss was 0")
-            return
+            return False
 
-        # Scale the gradients by number of elements, i.e. trainable indexes since last update
-        if loss_elem > 1:
+        if n_loss_elem > 1:
             for param in self.model.parameters():
                 if param.grad is not None:
-                    param.grad.data.div_(loss_elem)
-
-        self.log_grad_norm()
-        self.update_lr()
-        if self.gradient_clipping > 0:
-            self.grad_clip()
-        self.opt.step()
-        self.opt.zero_grad()
-        self.global_step += 1
-
-    def run_training(self):
-        model, tokenizer, diffusion = self.model, self.tokenizer, self.diffusion
-
-        pad_sequence_value = self.tokenizer.pad_id if self.tokenizer.pad_id > 0 else self.tokenizer.eos_id
-        collate = Collate(
-            max_sequence_length=self.sequence_length,
-            pad_sequence_value=pad_sequence_value,
-            random_length_expansion=True,
-            insert_value=tokenizer.pad_id,
-            insert_rate=0.0
-        )
-
-        train_dataloader = DataLoader(
-            self.train_dataset,
-            batch_size=self.batch_size,
-            shuffle=True,
-            num_workers=4,
-            pin_memory=False,
-            collate_fn=collate
-        )
-        data_iter = iter(train_dataloader)
-
-        logger.info(f"training loop started...")
-        while True:
-            for _ in range(self.accumulation_steps):
-                try:
-                    ids, length_mask, conditioning_mask = next(data_iter)
-                except StopIteration:
-                    data_iter = iter(train_dataloader)
-                    ids, length_mask, conditioning_mask = next(data_iter)
-
-                ids = ids.to(self.device)
-                length_mask = length_mask.to(self.device)
-                conditioning_mask = conditioning_mask.to(self.device)
-
-                embeddings = self.model.get_embeddings(ids)
-                loss_mask = torch.logical_and(length_mask, ~conditioning_mask)
-                ids = ids.masked_fill(~loss_mask, -100)
-
-                ce_loss = self.diffusion.ce_score_loss(
-                    model=self.model,
-                    x_target=embeddings,
-                    ids_target=ids,
-                    length_mask=length_mask,
-                    conditioning=embeddings,
-                    conditioning_mask=conditioning_mask
-                )
-                loss = ce_loss
-                loss.backward()
-
-                logger.log_kv_mean("training_loss", loss.item(), loss_mask.sum().item())
-                logger.log_kv_mean("ce_loss", ce_loss.item(), loss_mask.sum().item())
-
-                n_token, n_mask = length_mask.sum().item(), conditioning_mask.sum().item()
-                logger.log_kv_mean("n_token", n_token)
-                logger.log_kv_mean("p_mask", n_mask / n_token, n_token)
-
-            self.optimise()
-            self.log_step()
-            self.log_anisotropy()
-            self.update_ema_parameters()
-
-            if self.global_step % self.log_interval == 0:
-                logger.dump_kvs()
-
-            if self.global_step % self.save_interval == 0:
-                self.save()
-
-            if self.global_step % self.sample_interval == 0:
-                self.sample()
-
-            if self.max_updates is not None and self.global_step >= self.max_updates:
-                break
+                    param.grad.data.div_(n_loss_elem)
 
     def grad_clip(self):
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clipping)
