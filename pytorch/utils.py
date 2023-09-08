@@ -12,25 +12,26 @@ def append_dims(tensor, target_dims):
     return tensor[(...,) + (None,) * (target_dims - tensor_dims)]
 
 
-def count_parameters(model: nn.Module) -> int:
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-
 def get_weight_decay_parameters(
         model: nn.Module,
         whitelist_modules: Tuple[Type[nn.Module]] = (nn.Linear,)
 ) -> Tuple[List, List]:
-    decay = set()
-    for module_name, module in model.named_modules():
-        for param_name, param in module.named_parameters():
-            full_param_name = '%s.%s' % (module_name, param_name) if module_name else param_name
-            if param_name.endswith('weight') and isinstance(module, whitelist_modules) and param.requires_grad:
-                decay.add(full_param_name)
-    param_dict = {param_name: param for param_name, param in model.named_parameters() if param.requires_grad}
-    no_decay = set(param_dict.keys()) - decay
+    decay_params = set()
 
-    decay = [param_dict[param_name] for param_name in sorted(list(decay))]
-    no_decay = [param_dict[param_name] for param_name in sorted(list(no_decay))]
+    for module_name, module in model.named_modules():
+        if not isinstance(module, whitelist_modules):
+            continue
+        for param_name, param in module.named_parameters():
+            if param_name.endswith('weight') and param.requires_grad:
+                full_param_name = f'{module_name}.{param_name}' if module_name else param_name
+                decay_params.add(full_param_name)
+
+    param_dict = {param_name: param for param_name, param in model.named_parameters() if param.requires_grad}
+    no_decay_params = set(param_dict.keys()) - decay_params
+
+    decay = [param_dict[name] for name in sorted(decay_params)]
+    no_decay = [param_dict[name] for name in sorted(no_decay_params)]
+
     return decay, no_decay
 
 

@@ -87,6 +87,7 @@ class MultiStepScoreDiffusion:
             model: nn.Module,
             x_target: torch.Tensor,
             ids_target: torch.Tensor,
+            reduction: str = 'mean',
             **model_kwargs: Any
     ) -> torch.Tensor:
         u_shape = x_target.shape[:1] if random.uniform(0, 1) < 0.5 else x_target.shape[:2]
@@ -98,7 +99,7 @@ class MultiStepScoreDiffusion:
 
         logits = self.denoise(model, x_t, t, False, **model_kwargs)
 
-        loss = torch.nn.functional.cross_entropy(logits.transpose(2, 1), ids_target)
+        loss = torch.nn.functional.cross_entropy(logits.transpose(2, 1), ids_target, reduction=reduction)
 
         return loss
 

@@ -1,20 +1,19 @@
 import os
 import time
-from logging import getLogger
 
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from unidecode import unidecode
 
 from data import Collate
-from utils import \
-    append_dims, \
-    get_named_float_tensors, \
-    get_weight_decay_parameters, \
-    update_ema_parameters, \
+from utils import (
+    get_named_float_tensors,
+    get_weight_decay_parameters,
+    update_ema_parameters,
     compute_anisotropy
-
-logger = getLogger()
+)
+import logger
 
 
 class Trainer:
@@ -37,7 +36,8 @@ class Trainer:
             sample_conditioning,
             sample_iterations,
             resume_checkpoint,
-            weight_decay=0.0
+            weight_decay=0.0,
+            gradient_clipping=-1.0
     ):
         self.model = model
         self.diffusion = diffusion
@@ -57,6 +57,7 @@ class Trainer:
         self.sample_iterations = sample_iterations
         self.resume_checkpoint = resume_checkpoint
         self.weight_decay = weight_decay
+        self.gradient_clipping = gradient_clipping
 
         self.global_step = 0
         self.max_updates = None
@@ -72,7 +73,7 @@ class Trainer:
             {"params": no_decay, "weight_decay": 0.0},
         ]
 
-        self.optim = torch.optim.AdamW(
+        self.opt = torch.optim.AdamW(
             optim_groups,
             lr=self.learning_rate,
             weight_decay=self.weight_decay,
@@ -92,29 +93,29 @@ class Trainer:
     def load_model_checkpoint(self):
         checkpoint_path = os.path.join(self.model_dir, "model.pt")
         if os.path.exists(checkpoint_path):
-            logger.info(f"Loading checkpoint from {checkpoint_path}")
+            logger.info(f"loading checkpoint from {checkpoint_path}")
             model_state_dict = torch.load(checkpoint_path)
             self.model.load_state_dict(model_state_dict, strict=False)
 
     def load_optim_checkpoint(self):
         checkpoint_path = os.path.join(self.model_dir, "optim.pt")
         if os.path.exists(checkpoint_path):
-            logger.info(f"Loading checkpoint from {checkpoint_path}")
+            logger.info(f"loading checkpoint from {checkpoint_path}")
             optim_state_dict = torch.load(checkpoint_path)
             self.global_step = optim_state_dict.pop('global_step', self.global_step)
-            self.optim.load_state_dict(optim_state_dict)
+            self.opt.load_state_dict(optim_state_dict)
 
     def load_ema_checkpoints(self):
         all_named_tensors = get_named_float_tensors(self.model, include_buffers=True)
         for rate in self.ema_rate:
             ema_checkpoint_path = os.path.join(self.model_dir, f"ema_{rate}.pt")
             if os.path.exists(ema_checkpoint_path):
-                logger.info(f"Loading EMA checkpoint: {ema_checkpoint_path}")
+                logger.info(f"loading EMA checkpoint: {ema_checkpoint_path}")
                 ema_state_dict = torch.load(ema_checkpoint_path)
                 # Update or get tensors from the EMA state dict using model tensors names
                 ema_named_tensors = [(key, ema_state_dict[key]) for key, value in all_named_tensors]
             else:
-                logger.info(f"Initializing new EMA model with EMA rate of {rate}")
+                logger.info(f"initializing new EMA model with EMA rate of {rate}")
                 # Initialize EMA tensors with model's named tensors
                 ema_named_tensors = [(key, value.data.clone()) for key, value in all_named_tensors]
             self.ema_named_tensors.append(ema_named_tensors)
@@ -125,18 +126,18 @@ class Trainer:
             for name, tensor in ema_named_tensors:
                 ema_state_dict[name] = tensor
             checkpoint_path = os.path.join(self.model_dir, f"ema_{rate}.pt")
-            logger.info(f"Saving checkpoint: {checkpoint_path}")
+            logger.info(f"saving checkpoint: {checkpoint_path}")
             torch.save(ema_state_dict, checkpoint_path)
 
         model_state_dict = self.model.state_dict()
         checkpoint_path = os.path.join(self.model_dir, "model.pt")
-        logger.info(f"Saving checkpoint: {checkpoint_path}")
+        logger.info(f"saving checkpoint: {checkpoint_path}")
         torch.save(model_state_dict, checkpoint_path)
 
-        optim_state_dict = self.optim.state_dict()
+        optim_state_dict = self.opt.state_dict()
         optim_state_dict['global_step'] = self.global_step
         checkpoint_path = os.path.join(self.model_dir, "optim.pt")
-        logger.info(f"Saving checkpoint: {checkpoint_path}")
+        logger.info(f"saving checkpoint: {checkpoint_path}")
         torch.save(optim_state_dict, checkpoint_path)
 
     def update_ema_parameters(self):
@@ -150,23 +151,6 @@ class Trainer:
                 model_parameters.append(model_state_dict[key])
 
             update_ema_parameters(ema_model_parameters, model_parameters, rate)
-
-    def log(self):
-        current_time = time.time()
-        time_elapsed = current_time - self.prev_log_time
-        iteration_rate = self.iters_since_log / time_elapsed
-
-        log_msg = (
-            f"global_step: {self.global_step:,}, "
-            f"loss_iter: {self.loss_iter:.2e}, "
-            f"lr: {self.optim.param_groups[0]['lr']:.2e}, "
-            f"anisotropy: {compute_anisotropy(self.model.embedding.weight).item():.2e}, "
-            f"throughput: {iteration_rate:.2f} it/s"
-        )
-        logger.info(log_msg)
-
-        self.iters_since_log = 0
-        self.prev_log_time = current_time
 
     def prepare_conditioning(self):
         size = (self.sample_num_examples, self.sequence_length)
@@ -192,7 +176,7 @@ class Trainer:
         us = torch.arange(self.sample_iterations, device=z.device) / (self.sample_iterations - 1)
         ts = self.diffusion.rho_schedule(us.unsqueeze(-1))
 
-        logger.info(f"Sampling started...")
+        logger.info(f"sampling started...")
         logits = self.diffusion.sample_iterative(
             model=self.model,
             x_start=z * ts[0],
@@ -205,7 +189,7 @@ class Trainer:
 
         output_ids = torch.where(conditioning_mask, conditioning_ids, logits.argmax(-1)).cpu().tolist()
         decoded = self.tokenizer.decode(output_ids)
-        [logger.info(f"Sample {i}:\t{unidecode(text)}") for i, text in enumerate(decoded)]
+        [logger.info(f"sample {i}:\t{unidecode(text)}") for i, text in enumerate(decoded)]
 
     def optimise(self):
         # Determine the number of elements that contributed to the loss
@@ -217,7 +201,7 @@ class Trainer:
 
         # Check for invalid number of elements in loss
         if loss_elem == 0:
-            logger.error("Tried to optimize, but number of elements in loss was 0")
+            logger.error("tried to optimize, but number of elements in loss was 0")
             return
 
         # Scale the gradients by number of elements, i.e. trainable indexes since last update
@@ -226,15 +210,12 @@ class Trainer:
                 if param.grad is not None:
                     param.grad.data.div_(loss_elem)
 
-        # Update learning rate and perform optimization
-        self.optim.param_groups[0]['lr'] = self.learning_rate * min(self.global_step / 10000, 1.0)
-
-        # Clip gradients and update model parameters
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-        self.optim.step()
-        self.optim.zero_grad()
-
-        # Increment the global step counter
+        self.log_grad_norm()
+        self.update_lr()
+        if self.gradient_clipping > 0:
+            self.grad_clip()
+        self.opt.step()
+        self.opt.zero_grad()
         self.global_step += 1
 
     def run_training(self):
@@ -259,7 +240,7 @@ class Trainer:
         )
         data_iter = iter(train_dataloader)
 
-        logger.info(f"Training loop started...")
+        logger.info(f"training loop started...")
         while True:
             for _ in range(self.accumulation_steps):
                 try:
@@ -276,7 +257,7 @@ class Trainer:
                 loss_mask = torch.logical_and(length_mask, ~conditioning_mask)
                 ids = ids.masked_fill(~loss_mask, -100)
 
-                loss = self.diffusion.ce_score_loss(
+                ce_loss = self.diffusion.ce_score_loss(
                     model=self.model,
                     x_target=embeddings,
                     ids_target=ids,
@@ -284,17 +265,23 @@ class Trainer:
                     conditioning=embeddings,
                     conditioning_mask=conditioning_mask
                 )
-
+                loss = ce_loss
                 loss.backward()
 
-                self.loss_iter = loss
-                self.iters_since_log += 1
+                logger.log_kv_mean("training_loss", loss.item(), loss_mask.sum().item())
+                logger.log_kv_mean("ce_loss", ce_loss.item(), loss_mask.sum().item())
+
+                n_token, n_mask = length_mask.sum().item(), conditioning_mask.sum().item()
+                logger.log_kv_mean("n_token", n_token)
+                logger.log_kv_mean("p_mask", n_mask / n_token, n_token)
 
             self.optimise()
+            self.log_step()
+            self.log_anisotropy()
             self.update_ema_parameters()
 
             if self.global_step % self.log_interval == 0:
-                self.log()
+                logger.dump_kvs()
 
             if self.global_step % self.save_interval == 0:
                 self.save()
@@ -304,3 +291,25 @@ class Trainer:
 
             if self.max_updates is not None and self.global_step >= self.max_updates:
                 break
+
+    def grad_clip(self):
+        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clipping)
+
+    def log_grad_norm(self):
+        sq_sum = 0.0
+        for p in self.model.parameters():
+            if not p.requires_grad:
+                continue
+            sq_sum += (p.grad ** 2).sum().item()
+        logger.log_kv_mean("grad_norm", np.sqrt(sq_sum))
+
+    def update_lr(self):
+        lr = self.learning_rate * min(self.global_step / 10000, 1.0)
+        self.opt.param_groups[0]['lr'] = lr
+        logger.log_kv("lr", lr)
+
+    def log_step(self):
+        logger.log_kv("step", self.global_step)
+
+    def log_anisotropy(self):
+        logger.log_kv("anisotropy", compute_anisotropy(self.model.embedding.weight).item())
