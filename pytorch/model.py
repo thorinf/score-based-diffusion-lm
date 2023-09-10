@@ -38,14 +38,14 @@ class MultiHeadAttention(nn.Module):
             q = self.rotary_emb.rotate_queries_or_keys(q)
             k = self.rotary_emb.rotate_queries_or_keys(k)
 
-        # with torch.backends.cuda.sdp_kernel(enable_flash=True):
-        #     out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.1 if self.training else 0.0)
+        with torch.backends.cuda.sdp_kernel(enable_flash=True):
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.1 if self.training else 0.0)
 
-        score = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
-        if mask is not None:
-            score = score.masked_fill(mask == 0, -1e9)
-        score = F.softmax(score, dim=-1)
-        out = score @ v
+        # score = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
+        # if mask is not None:
+        #     score = score.masked_fill(mask == 0, -1e9)
+        # score = F.softmax(score, dim=-1)
+        # out = score @ v
 
         out = out.transpose(1, 2).contiguous().view(bsz, slen, self.model_dim)
         return self.w_o(out)
@@ -175,7 +175,10 @@ class ScoreLM(nn.Module):
 
     @staticmethod
     def self_attention_mask(length_mask):
-        return torch.logical_and(length_mask.unsqueeze(1).unsqueeze(1), length_mask.unsqueeze(1).unsqueeze(-1))
+        bsz, slen = length_mask.shape
+        mask = torch.zeros(bsz, slen, slen, dtype=torch.bool, device=length_mask.device)
+        mask = mask.masked_fill(length_mask.unsqueeze(1), True)
+        return mask.unsqueeze(1)
 
     def forward(self, x, t, length_mask=None, conditioning=None, conditioning_mask=None):
         bsz, slen, _ = x.shape
