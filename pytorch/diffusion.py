@@ -113,21 +113,57 @@ class MultiStepScoreDiffusion:
             **model_kwargs: Any
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         x = x_start
-        t = ts[0]
         logits = None
 
-        for i in range(len(ts)):
+        indices = range(len(ts))
+        for i in indices:
+            t, t_next = ts[i], ts[i + 1] if i + 1 != len(ts) else 0.0
+
             denoised = self.denoise(model, x, t, interpolate is None, **model_kwargs)
 
             if interpolate is not None:
-                denoised, logits = interpolate(denoised), x
+                denoised, logits = interpolate(denoised), denoised
 
-            t_next = ts[i + 1] if i + 1 != len(ts) else 0.0
             d = (x - denoised) / append_dims(t, x.ndim)
             dt = append_dims(t_next - t, d.ndim)
             x = x + (d * dt)
 
-            t = t_next
+        return logits if interpolate else x
+
+    @torch.no_grad()
+    def sample_edm(
+            self,
+            model: nn.Module,
+            x_start: torch.Tensor,
+            ts: torch.Tensor,
+            interpolate: Callable = None,
+            heun: bool = False,
+            **model_kwargs: Any
+    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+        x = x_start
+        logits = None
+
+        indices = range(len(ts))
+        for i in indices:
+            t, t_next = ts[i], ts[i + 1] if i + 1 != len(ts) else 0.0
+            x_cur = x
+
+            denoised = self.denoise(model, x_cur, t, interpolate is None, **model_kwargs)
+
+            if interpolate is not None:
+                denoised, logits = interpolate(denoised), denoised
+
+            d = (x_cur - denoised) / t
+            x = x_cur + (t_next - t) * d
+
+            if i < len(ts) - 1 and heun:
+                denoised = self.denoise(model, x, t_next, interpolate is None, **model_kwargs)
+
+                if interpolate is not None:
+                    denoised, logits = interpolate(denoised), denoised
+
+                d_prime = (x - denoised) / t_next
+                x = x_cur + (t_next - t) * (0.5 * d + 0.5 * d_prime)
 
         return logits if interpolate else x
 
@@ -143,7 +179,9 @@ class MultiStepScoreDiffusion:
         x = x_start
         logits = None
 
-        for i, t in enumerate(ts):
+        indices = range(len(ts))
+        for i in indices:
+            t = ts[i]
             if i != 0:
                 z = torch.randn_like(x)
                 x = x + z * append_dims(t, z.ndim)
