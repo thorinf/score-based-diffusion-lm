@@ -82,13 +82,13 @@ class TransformerEncoderLayer(nn.Module):
     def forward(self, x, emb, mask=None):
         h = self.norm1(x)
         scale, shift = self.emb1(emb).chunk(2, dim=-1)
-        h = h * scale + shift
+        h = h * (1 + scale) + shift
         h = self.attention(q=h, k=h, v=h, mask=mask)
         x = x + self.dropout1(h)
 
         h = self.norm2(x)
         scale, shift = self.emb2(emb).chunk(2, dim=-1)
-        h = h * scale + shift
+        h = h * (1 + scale) + shift
         h = self.ffn(h)
         x = x + self.dropout2(h)
         return x
@@ -131,10 +131,7 @@ class ScoreLM(nn.Module):
 
         self.embedding = nn.Embedding(self.num_classes, self.embedding_dim)
 
-        self.project = nn.Sequential(
-            nn.Dropout(p=self.dropout_prob),
-            nn.Linear(self.embedding_dim, self.model_dim, bias=True),
-        )
+        self.project = nn.Linear(self.embedding_dim, self.model_dim, bias=True)
 
         self.time_embed = nn.Sequential(
             LearnedSinusoidalPosEmb(learned_sinusoidal_dim),
