@@ -25,6 +25,11 @@ class MultiHeadAttention(nn.Module):
 
         self.rotary_emb = rotary_embedding
 
+        nn.init.xavier_uniform_(self.w_q.weight, gain=1 / math.sqrt(2))
+        nn.init.xavier_uniform_(self.w_k.weight, gain=1 / math.sqrt(2))
+        nn.init.xavier_uniform_(self.w_v.weight, gain=1 / math.sqrt(2))
+        nn.init.xavier_uniform_(self.w_o.weight)
+
     def forward(self, q, k, v, mask=None):
         bsz, seqlen, _ = q.shape
 
@@ -63,7 +68,7 @@ class TransformerEncoderLayer(nn.Module):
             dim=dim,
             num_heads=num_heads,
             qkv_bias=True,
-            rotary_embedding=RotaryEmbedding(dim=int(dim / (num_heads * 2)))
+            rotary_embedding=RotaryEmbedding(dim=int(dim / num_heads))
         )
         self.dropout1 = nn.Dropout(p=drop_prob)
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
@@ -130,8 +135,9 @@ class ScoreLM(nn.Module):
         self.interpolate_temperature = 1.0
 
         self.embedding = nn.Embedding(self.num_classes, self.embedding_dim)
+        nn.init.normal_(self.embedding.weight, mean=0.0, std=0.001)
 
-        self.project = nn.Linear(self.embedding_dim, self.model_dim, bias=True)
+        self.project = nn.Linear(self.embedding_dim, self.model_dim)
 
         self.time_embed = nn.Sequential(
             LearnedSinusoidalPosEmb(learned_sinusoidal_dim),
@@ -152,20 +158,7 @@ class ScoreLM(nn.Module):
             )
             for _ in range(num_layers))
 
-        self.norm = nn.LayerNorm(self.model_dim)
-
-        self.output = nn.Linear(self.model_dim, self.num_classes, bias=False)
-
-        self.apply(self.initialise_weights)
-
-    @staticmethod
-    def initialise_weights(module):
-        if isinstance(module, nn.Linear):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
-            if module.bias is not None:
-                torch.nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.001)
+        self.output = nn.Linear(self.model_dim, self.num_classes)
 
     def get_embeddings(self, ids):
         e = self.embedding(ids)
@@ -211,6 +204,5 @@ class ScoreLM(nn.Module):
                 continue
             h = layer(h, emb=emb, mask=attention_mask)
 
-        h = self.norm(h)
         output = self.output(h).float()
         return output
