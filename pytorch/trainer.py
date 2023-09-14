@@ -10,7 +10,8 @@ from utils import (
     get_named_float_tensors,
     get_weight_decay_parameters,
     update_ema_parameters,
-    compute_anisotropy
+    compute_anisotropy,
+    cosine_decay_with_warmup
 )
 import logger
 
@@ -59,7 +60,7 @@ class Trainer:
         self.gradient_clipping = gradient_clipping
 
         self.global_step = 0
-        self.max_updates = None
+        self.max_updates = 1e6
 
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
@@ -72,11 +73,7 @@ class Trainer:
             {"params": no_decay, "weight_decay": 0.0},
         ]
 
-        self.opt = torch.optim.AdamW(
-            optim_groups,
-            lr=self.learning_rate,
-            betas=(0.9, 0.98)
-        )
+        self.opt = torch.optim.AdamW(optim_groups, lr=self.learning_rate)
         self.load_optim_checkpoint()
 
         self.ema_named_tensors = []
@@ -177,7 +174,7 @@ class Trainer:
             loss_mask = torch.logical_and(length_mask, ~conditioning_mask)
             ids = ids.masked_fill(~loss_mask, -100)
 
-            ce_loss = self.diffusion.ce_score_loss(
+            losses = self.diffusion.ce_score_loss(
                 model=self.model,
                 x_target=embeddings,
                 ids_target=ids,
@@ -185,11 +182,13 @@ class Trainer:
                 conditioning=embeddings,
                 conditioning_mask=conditioning_mask
             )
-            loss = ce_loss
+            loss = losses["loss"]
             loss.backward()
 
-            logger.log_kv_mean("training_loss", loss.item(), loss_mask.sum().item())
-            logger.log_kv_mean("ce_loss", ce_loss.item(), loss_mask.sum().item())
+            n_elem = losses["n_elem"].item()
+            logger.log_kv_mean("loss", loss.item(), n_elem)
+            logger.log_kv_mean("ce", losses["ce"].item(), n_elem)
+            logger.log_kv_mean("wce", losses["wce"].item(), n_elem)
 
             n_token, n_mask = length_mask.sum().item(), conditioning_mask.sum().item()
             logger.log_kv_mean("n_token", n_token)
@@ -230,7 +229,8 @@ class Trainer:
         logger.log_kv_mean("grad_norm", np.sqrt(sq_sum))
 
     def update_lr(self):
-        lr = self.learning_rate * min(self.global_step / self.warmup_steps, 1.0)
+        lr = cosine_decay_with_warmup(self.global_step, self.learning_rate, int(self.warmup_steps),
+                                      int(self.max_updates))
         self.opt.param_groups[0]['lr'] = lr
         logger.log_kv("lr", lr)
 
@@ -264,7 +264,7 @@ class Trainer:
         ts = self.diffusion.rho_schedule(us.unsqueeze(-1))
 
         logger.info(f"sampling started...")
-        logits = self.diffusion.sample_iterative(
+        logits = self.diffusion.sample_euler(
             model=self.model,
             x_start=z * ts[0],
             ts=ts,

@@ -1,5 +1,5 @@
 import random
-from typing import Any, Callable, List, Tuple, TypeVar, Union
+from typing import Any, Callable, Dict, List, Tuple, TypeVar, Union
 
 import torch
 import torch.nn as nn
@@ -65,7 +65,7 @@ class MultiStepScoreDiffusion:
             model: nn.Module,
             x_target: torch.Tensor,
             **model_kwargs: Any
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> Dict[str, torch.Tensor]:
         u_shape = x_target.shape[:1] if random.uniform(0, 1) < 0.5 else x_target.shape[:2]
         u = torch.rand(u_shape, dtype=x_target.dtype, device=x_target.device, requires_grad=False)
         t = self.rho_schedule(u)
@@ -76,20 +76,23 @@ class MultiStepScoreDiffusion:
         model_output = self.denoise(model, x_t, t, **model_kwargs)
 
         weights = append_dims(self.loss_weight(t), x_target.ndim)
-        mse = weights * (x_target.detach() - model_output) ** 2.0
+        mse = (x_target.detach() - model_output) ** 2.0
 
-        loss = mse.mean()
+        terms = {}
+        terms["xs_mse"] = mse.mean()
+        terms["mse"] = (weights * mse).mean()
+        terms["loss"] = terms["mse"]
 
-        return loss
+        return terms
 
     def ce_score_loss(
             self,
             model: nn.Module,
             x_target: torch.Tensor,
             ids_target: torch.Tensor,
-            reduction: str = 'mean',
+            ignore_index: int = -100,
             **model_kwargs: Any
-    ) -> torch.Tensor:
+    ) -> Dict[str, torch.Tensor]:
         u_shape = x_target.shape[:1] if random.uniform(0, 1) < 0.5 else x_target.shape[:2]
         u = torch.rand(u_shape, dtype=x_target.dtype, device=x_target.device, requires_grad=False)
         t = self.rho_schedule(u)
@@ -99,9 +102,16 @@ class MultiStepScoreDiffusion:
 
         logits = self.denoise(model, x_t, t, False, **model_kwargs)
 
-        loss = torch.nn.functional.cross_entropy(logits.transpose(2, 1), ids_target, reduction=reduction)
+        loss = torch.nn.functional.cross_entropy(logits.transpose(1, -1), ids_target, reduction='none',
+                                                 ignore_index=ignore_index)
 
-        return loss
+        terms = {}
+        terms["n_elem"] = (ids_target != ignore_index).sum()
+        terms["ce"] = loss.sum() / terms["n_elem"]
+        terms["wce"] = (loss * self.loss_weight(t)).sum() / terms["n_elem"]
+        terms["loss"] = terms["wce"]
+
+        return terms
 
     @torch.no_grad()
     def sample_euler(
