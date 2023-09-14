@@ -70,7 +70,7 @@ class HumanOutputFormat(SeqWriter, KVWriter):
         return s[: max_len - 3] + "..." if len(s) > max_len else s
 
     @staticmethod
-    def _format_table(kvs, n_columns):
+    def _format_table(kvs, n_columns=2):
         key_width = max(map(len, kvs.keys()))
         val_width = max(map(len, kvs.values()))
 
@@ -102,7 +102,7 @@ class JSONOutputFormat(KVWriter):
     def __init__(self, filename):
         self.file = open(filename, "wt")
 
-    def writekvs(self, kvs):
+    def write_kvs(self, kvs):
         for k, v in sorted(kvs.items()):
             if hasattr(v, "dtype"):
                 kvs[k] = float(v)
@@ -111,6 +111,38 @@ class JSONOutputFormat(KVWriter):
 
     def close(self):
         self.file.close()
+
+
+class CSVOutputFormat(KVWriter):
+    def __init__(self, filename):
+        self.file = open(filename, 'w+t')
+        self.keys = []
+        self.sep = ','
+
+    def write_kvs(self, kvs):
+        extra_keys = sorted(list(kvs.keys() - self.keys))
+
+        if extra_keys:
+            self.keys.extend(extra_keys)
+            self.file.seek(0)
+            lines = self.file.readlines()
+            self.file.seek(0)
+
+            self.file.write(self.sep.join(self.keys) + '\n')
+
+            for line in lines[1:]:
+                padding = ["" for _ in extra_keys]
+                updated_line = line.strip() + self.sep + self.sep.join(padding) + '\n'
+                self.file.write(updated_line)
+
+        values = [str(kvs.get(key, "")) for key in self.keys]
+        self.file.write(self.sep.join(values) + '\n')
+
+        self.file.flush()
+
+    def close(self):
+        self.file.close()
+
 
 class WandBOutputFormat(KVWriter):
     def __init__(self):
@@ -181,6 +213,8 @@ def configure(output_dir):
     output_formats = [
         HumanOutputFormat(sys.stdout),
         HumanOutputFormat(osp.join(output_dir, "log.txt")),
+        JSONOutputFormat(osp.join(output_dir, "log.json")),
+        CSVOutputFormat(osp.join(output_dir, "log.csv")),
         WandBOutputFormat()
     ]
 
