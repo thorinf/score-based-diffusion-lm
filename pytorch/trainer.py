@@ -231,7 +231,7 @@ class Trainer:
     def update_lr(self):
         lr = cosine_decay_with_warmup(self.global_step, self.learning_rate, int(self.warmup_steps),
                                       int(self.max_updates))
-        self.opt.param_groups[0]['lr'] = lr
+        [param_group.update({"lr": lr}) for param_group in self.opt.param_groups]
         logger.log_kv("lr", lr)
 
     def log_anisotropy(self):
