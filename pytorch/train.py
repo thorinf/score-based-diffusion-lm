@@ -20,9 +20,10 @@ def main():
 
     model = ScoreLM(
         num_classes=len(tokenizer),
-        embedding_dim=args.embedding_dim,
         model_dim=args.model_dim,
+        embedding_dim=args.embedding_dim,
         num_layers=args.num_layers,
+        num_heads=args.num_heads,
         dropout_prob=args.dropout_prob,
         layerdrop_prob=args.layerdrop_prob,
     )
@@ -41,6 +42,7 @@ def main():
         name=args.model_dir,
         project=os.getenv("WANDB_PROJECT", "score_diffusion_lm"),
         dir=args.model_dir,
+        resume=True
     )
     wandb.config.update(args.__dict__, allow_val_change=True)
 
@@ -82,7 +84,7 @@ def main():
         sample_interval=args.sample_interval,
         sample_size=(args.num_examples, args.sequence_length),
         sample_conditioning=conditional_starts,
-        sample_iterations=1000,
+        sample_iterations=200,
         resume_checkpoint=True,
         warmup_steps=args.warmup_steps,
         weight_decay=args.weight_decay,
@@ -93,13 +95,13 @@ def main():
 
 def create_argparser():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-bsz', '--batch_size', type=int, default=128)
+    parser.add_argument('-bsz', '--batch_size', type=int, default=64)
     parser.add_argument('-acc', '--accumulation_steps', type=int, default=1)
     parser.add_argument('-svi', '--log_interval', type=int, default=50)
     parser.add_argument('-lgi', '--save_interval', type=int, default=1000)
     parser.add_argument('-smi', '--sample_interval', type=int, default=10000)
 
-    parser.add_argument('-edim', '--embedding_dim', type=int, default=128)
+    parser.add_argument('-edim', '--embedding_dim', type=int, default=256)
     parser.add_argument('-mdim', '--model_dim', type=int, default=1024)
     parser.add_argument('-nl', '--num_layers', type=int, default=8)
     parser.add_argument('-nh', '--num_heads', type=int, default=8)
@@ -107,9 +109,9 @@ def create_argparser():
     parser.add_argument('-ldp', '--layerdrop_prob', type=float, default=0.0)
 
     parser.add_argument('-lr', '--learning_rate', type=float, default=1e-4)
-    parser.add_argument('-wus', '--warmup_steps', type=int, default=1e5)
+    parser.add_argument('-wus', '--warmup_steps', type=int, default=3e4)
     parser.add_argument('-wd', '--weight_decay', type=float, default=0.1)
-    parser.add_argument('-gc', '--gradient_clipping', type=float, default=-1.0)
+    parser.add_argument('-gc', '--gradient_clipping', type=float, default=1.0)
     parser.add_argument('-ema', '--ema_rate', default="0.95, 0.9999")
 
     parser.add_argument('-slen', '--sequence_length', type=int, default=64)
