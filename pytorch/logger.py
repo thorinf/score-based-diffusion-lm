@@ -30,9 +30,10 @@ class KVWriter(object):
 
 
 class HumanOutputFormat(SeqWriter, KVWriter):
-    def __init__(self, filename, num_columns=4):
+    def __init__(self, filename, overwrite=True, num_columns=4):
+        mode = "wt" if overwrite else "at"
         if isinstance(filename, str):
-            self.file = open(filename, "wt")
+            self.file = open(filename, mode)
             self.own_file = True
         else:
             assert hasattr(filename, "read"), "expected file or str, got %s" % filename
@@ -99,8 +100,9 @@ class HumanOutputFormat(SeqWriter, KVWriter):
 
 
 class JSONOutputFormat(KVWriter):
-    def __init__(self, filename):
-        self.file = open(filename, "wt")
+    def __init__(self, filename, overwrite=True):
+        mode = "wt" if overwrite else "at"
+        self.file = open(filename, mode)
 
     def write_kvs(self, kvs):
         for k, v in sorted(kvs.items()):
@@ -114,10 +116,17 @@ class JSONOutputFormat(KVWriter):
 
 
 class CSVOutputFormat(KVWriter):
-    def __init__(self, filename):
-        self.file = open(filename, 'w+t')
+    def __init__(self, filename, overwrite=True):
+        mode = 'w+t' if overwrite else 'a+t'
+        self.file = open(filename, mode)
         self.keys = []
         self.sep = ','
+
+        if not overwrite:
+            self.file.seek(0)
+            header = self.file.readline().strip()
+            if header:
+                self.keys = header.split(self.sep)
 
     def write_kvs(self, kvs):
         extra_keys = sorted(list(kvs.keys() - self.keys))
@@ -209,12 +218,12 @@ def configure_pylogging_handler():
     logger.info("redirecting to custom logger")
 
 
-def configure(output_dir):
+def configure(output_dir, overwrite=False):
     output_formats = [
         HumanOutputFormat(sys.stdout),
-        HumanOutputFormat(osp.join(output_dir, "log.txt")),
-        JSONOutputFormat(osp.join(output_dir, "log.json")),
-        CSVOutputFormat(osp.join(output_dir, "log.csv")),
+        HumanOutputFormat(osp.join(output_dir, "log.txt"), overwrite=overwrite),
+        JSONOutputFormat(osp.join(output_dir, "log.json"), overwrite=overwrite),
+        CSVOutputFormat(osp.join(output_dir, "log.csv"), overwrite=overwrite),
         WandBOutputFormat()
     ]
 
