@@ -105,10 +105,12 @@ class MultiStepScoreDiffusion:
         loss = torch.nn.functional.cross_entropy(logits.transpose(1, -1), ids_target, reduction='none',
                                                  ignore_index=ignore_index)
 
+        weight = self.loss_weight(append_dims(t, loss.ndim))
+
         terms = {}
         terms["n_elem"] = (ids_target != ignore_index).sum()
         terms["ce"] = loss.sum() / terms["n_elem"]
-        terms["wce"] = (loss * self.loss_weight(t)).sum() / terms["n_elem"]
+        terms["wce"] = (loss * weight).sum() / terms["n_elem"]
         terms["loss"] = terms["wce"]
 
         return terms
