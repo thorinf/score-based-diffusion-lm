@@ -1,5 +1,6 @@
 import argparse
 import os
+import json
 import logger
 from data import SentencePieceTokenizer, TextDataset, Collate, infinite_loader
 from torch.utils.data import DataLoader
@@ -37,6 +38,10 @@ def main():
 
     num_params = sum(p.numel() for p in model.parameters())
     logger.log(f"total parameter count: {num_params:,}")
+
+    logger.log(f"saving the hyperparameters to {args.model_dir}/training_args.json")
+    with open(f"{args.model_dir}/training_args.json", "w") as f:
+        json.dump(args.__dict__, f, indent=2)
 
     wandb.init(
         name=args.model_dir,
