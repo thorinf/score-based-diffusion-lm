@@ -15,6 +15,8 @@ from utils import (
 )
 import logger
 
+INITIAL_LOG_LOSS_SCALE = 20.0
+
 
 class Trainer:
     def __init__(
@@ -35,6 +37,8 @@ class Trainer:
             sample_conditioning,
             sample_iterations,
             resume_checkpoint,
+            use_fp16=False,
+            fp16_scale_growth=1e-3,
             warmup_steps=1e5,
             weight_decay=0.0,
             gradient_clipping=-1.0
@@ -55,6 +59,8 @@ class Trainer:
         self.sample_conditioning = sample_conditioning
         self.sample_iterations = sample_iterations
         self.resume_checkpoint = resume_checkpoint
+        self.use_fp16 = use_fp16
+        self.fp16_scale_growth = fp16_scale_growth
         self.warmup_steps = warmup_steps
         self.weight_decay = weight_decay
         self.gradient_clipping = gradient_clipping
@@ -66,6 +72,8 @@ class Trainer:
 
         self.model.to(self.device)
         self.load_model_checkpoint()
+
+        self.log_loss_scale = INITIAL_LOG_LOSS_SCALE
 
         decay, no_decay = get_weight_decay_parameters(self.model)
         optim_groups = [
@@ -132,14 +140,12 @@ class Trainer:
     def update_ema_parameters(self):
         model_state_dict = self.model.state_dict()
         for ema_named_tensors, rate in zip(self.ema_named_tensors, self.ema_rate):
-            model_parameters = []
-            ema_model_parameters = []
+            ema_parameters_list, model_parameters_list = zip(*[
+                (ema_parameter, model_state_dict[key])
+                for key, ema_parameter in ema_named_tensors
+            ])
 
-            for key, ema_parameter in ema_named_tensors:
-                ema_model_parameters.append(ema_parameter)
-                model_parameters.append(model_state_dict[key])
-
-            update_ema_parameters(ema_model_parameters, model_parameters, rate)
+            update_ema_parameters(ema_parameters_list, model_parameters_list, rate)
 
     def run_loop(self):
         logger.info(f"training loop started...")
@@ -148,15 +154,21 @@ class Trainer:
             if self.global_step % self.log_interval == 0:
                 logger.dump_kvs()
             if self.global_step % self.save_interval == 0:
-                self.save()
+                pass
+                # self.save()
             if self.global_step % self.sample_interval == 0:
                 self.sample()
+                logger.info(f"resuming training...")
             if self.max_updates is not None and self.global_step >= self.max_updates:
+                logger.info(f"training completed {self.max_updates} maximum steps...")
                 break
 
     def run_step(self):
         self.forward_backward()
-        self.optimise()
+        if self.use_fp16:
+            self.optimize_fp16()
+        else:
+            self.optimise()
         self.update_ema_parameters()
         self.log_anisotropy()
         self.log_step()
@@ -174,16 +186,17 @@ class Trainer:
             loss_mask = torch.logical_and(length_mask, ~conditioning_mask)
             ids = ids.masked_fill(~loss_mask, -100)
 
-            losses = self.diffusion.ce_score_loss(
-                model=self.model,
-                x_target=embeddings,
-                ids_target=ids,
-                length_mask=length_mask,
-                conditioning=embeddings,
-                conditioning_mask=conditioning_mask
-            )
+            with torch.cuda.amp.autocast(enabled=self.use_fp16):
+                losses = self.diffusion.ce_score_loss(
+                    model=self.model,
+                    x_target=embeddings,
+                    ids_target=ids,
+                    length_mask=length_mask,
+                    conditioning=embeddings,
+                    conditioning_mask=conditioning_mask
+                )
+
             loss = losses["loss"]
-            loss.backward()
 
             n_elem = losses["n_elem"].item()
             logger.log_kv_mean("loss", loss.item(), n_elem)
@@ -194,8 +207,22 @@ class Trainer:
             logger.log_kv_mean("n_token", n_token)
             logger.log_kv_mean("p_mask", n_mask / n_token, n_token)
 
+            if self.use_fp16:
+                loss_scale = 2 ** self.log_loss_scale
+                (loss * loss_scale).backward()
+            else:
+                loss.backward()
+
     def optimise(self):
-        self.scale_grads()
+        n_loss_elem = getattr(self, "n_loss_elem", self.accumulation_steps)
+        if hasattr(self, "n_loss_elem"):
+            setattr(self, "n_loss_elem", 0)
+
+        if n_loss_elem == 0:
+            logger.error("tried to optimize, but number of elements in loss was 0")
+            return
+
+        self.scale_grads(1.0 / n_loss_elem)
         self.log_grad_norm()
         self.update_lr()
         if self.gradient_clipping > 0:
@@ -203,19 +230,40 @@ class Trainer:
         self.opt.step()
         self.global_step += 1
 
-    def scale_grads(self):
+    def optimize_fp16(self):
         n_loss_elem = getattr(self, "n_loss_elem", self.accumulation_steps)
         if hasattr(self, "n_loss_elem"):
             setattr(self, "n_loss_elem", 0)
 
         if n_loss_elem == 0:
-            logger.error("tried to optimize, but number of elements in loss was 0")
-            return False
+            logger.log("tried to optimize, but number of elements in loss was 0")
+            return
 
-        if n_loss_elem > 1:
-            for param in self.model.parameters():
-                if param.grad is not None:
-                    param.grad.data.div_(n_loss_elem)
+        if not self.grad_is_finite():
+            self.log_loss_scale -= 1
+            logger.log(f"found NaN, decreased log_loss_scale to {self.log_loss_scale}")
+            return
+
+        self.scale_grads(1.0 / (n_loss_elem * (2 ** self.log_loss_scale)))
+        self.log_grad_norm()
+        self.update_lr()
+        if self.gradient_clipping > 0:
+            self.grad_clip()
+        self.opt.step()
+        self.log_loss_scale += self.fp16_scale_growth
+        self.global_step += 1
+
+    def grad_is_finite(self):
+        for param in self.model.parameters():
+            if param.grad is not None:
+                if not torch.isfinite(param.grad).all():
+                    return False
+        return True
+
+    def scale_grads(self, scale):
+        for param in self.model.parameters():
+            if param.grad is not None:
+                param.grad.data.mul_(scale)
 
     def grad_clip(self):
         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clipping)
@@ -239,6 +287,8 @@ class Trainer:
 
     def log_step(self):
         logger.log_kv("step", self.global_step)
+        if self.use_fp16:
+            logger.log_kv("log_loss_scale", self.log_loss_scale)
 
     def prepare_conditioning(self):
         conditioning_ids = torch.zeros(self.sample_size, dtype=torch.int64, device=self.device)

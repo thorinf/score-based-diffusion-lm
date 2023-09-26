@@ -66,7 +66,7 @@ def main():
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
-        num_workers=4,
+        num_workers=1,
         pin_memory=False,
         collate_fn=collate
     )
@@ -91,6 +91,7 @@ def main():
         sample_conditioning=conditional_starts,
         sample_iterations=200,
         resume_checkpoint=True,
+        use_fp16=args.use_fp16,
         warmup_steps=args.warmup_steps,
         weight_decay=args.weight_decay,
         gradient_clipping=args.gradient_clipping,
@@ -100,7 +101,7 @@ def main():
 
 def create_argparser():
     parser = argparse.ArgumentParser()
-    parser.add_argument('-bsz', '--batch_size', type=int, default=64)
+    parser.add_argument('-bsz', '--batch_size', type=int, default=128)
     parser.add_argument('-acc', '--accumulation_steps', type=int, default=1)
     parser.add_argument('-svi', '--log_interval', type=int, default=50)
     parser.add_argument('-lgi', '--save_interval', type=int, default=1000)
@@ -115,6 +116,7 @@ def create_argparser():
 
     parser.add_argument('-lr', '--learning_rate', type=float, default=1e-4)
     parser.add_argument('-wus', '--warmup_steps', type=int, default=3e4)
+    parser.add_argument('-hp', '--use_fp16', type=bool, default=False)
     parser.add_argument('-wd', '--weight_decay', type=float, default=0.1)
     parser.add_argument('-gc', '--gradient_clipping', type=float, default=1.0)
     parser.add_argument('-ema', '--ema_rate', default="0.95, 0.9999")

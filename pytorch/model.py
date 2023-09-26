@@ -11,12 +11,13 @@ from utils import append_dims
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, dim, num_heads, qkv_bias=True, rotary_embedding=None):
+    def __init__(self, dim, num_heads, qkv_bias=True, rotary_embedding=None, dropout_prob=0.0):
         super(MultiHeadAttention, self).__init__()
         assert (dim % num_heads == 0)
         self.model_dim = dim
         self.head_dim = dim // num_heads
         self.num_heads = num_heads
+        self.dropout_prob = dropout_prob
 
         self.w_q = nn.Linear(dim, dim, bias=qkv_bias)
         self.w_k = nn.Linear(dim, dim, bias=qkv_bias)
@@ -44,7 +45,9 @@ class MultiHeadAttention(nn.Module):
             k = self.rotary_emb.rotate_queries_or_keys(k)
 
         with torch.backends.cuda.sdp_kernel(enable_flash=True):
-            output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=0.1 if self.training else 0.0)
+            dropout_p = self.dropout_prob if self.training else 0.0
+            mask = torch.where(mask, torch.tensor(0.0), torch.tensor(-1e4))
+            output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=dropout_p)
 
         # score = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
         # if mask is not None:
@@ -57,43 +60,37 @@ class MultiHeadAttention(nn.Module):
 
 
 class TransformerEncoderLayer(nn.Module):
-    def __init__(self, dim, hidden_dim, emb_dim, num_heads=8, drop_prob=0.0):
+    def __init__(self, dim, hidden_dim, emb_dim, num_heads=8, dropout_prob=0.0):
         super(TransformerEncoderLayer, self).__init__()
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False)
-        self.emb1 = nn.Sequential(
-            nn.Dropout(p=drop_prob),
-            nn.Linear(emb_dim, 2 * dim),
-        )
+        self.emb1 = nn.Linear(emb_dim, 2 * dim)
         self.attention = MultiHeadAttention(
             dim=dim,
             num_heads=num_heads,
             qkv_bias=True,
-            rotary_embedding=RotaryEmbedding(dim=int(dim / num_heads))
+            rotary_embedding=RotaryEmbedding(dim=dim // (num_heads * 2)),
+            dropout_prob=dropout_prob
         )
-        self.dropout1 = nn.Dropout(p=drop_prob)
+        self.dropout1 = nn.Dropout(p=dropout_prob)
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
-        self.emb2 = nn.Sequential(
-            nn.Dropout(p=drop_prob),
-            nn.Linear(emb_dim, 2 * dim),
-        )
+        self.emb2 = nn.Linear(emb_dim, 2 * dim)
         self.ffn = nn.Sequential(
             nn.Linear(dim, hidden_dim),
             nn.GELU(),
-            nn.Dropout(p=drop_prob),
             nn.Linear(hidden_dim, dim),
         )
-        self.dropout2 = nn.Dropout(p=drop_prob)
+        self.dropout2 = nn.Dropout(p=dropout_prob)
 
     def forward(self, x, emb, mask=None):
         h = self.norm1(x)
         scale, shift = self.emb1(emb).chunk(2, dim=-1)
-        h = h * (1 + scale) + shift
+        h = h * scale + shift
         h = self.attention(q=h, k=h, v=h, mask=mask)
         x = x + self.dropout1(h)
 
         h = self.norm2(x)
         scale, shift = self.emb2(emb).chunk(2, dim=-1)
-        h = h * (1 + scale) + shift
+        h = h * scale + shift
         h = self.ffn(h)
         x = x + self.dropout2(h)
         return x
@@ -143,7 +140,7 @@ class ScoreLM(nn.Module):
             LearnedSinusoidalPosEmb(learned_sinusoidal_dim),
             nn.Linear(self.learned_sinusoidal_dim + 1, 128),
             nn.GELU(),
-            nn.Dropout(p=self.dropout_prob),
+            nn.Dropout(self.dropout_prob),
             nn.Linear(128, 128),
             nn.GELU()
         )
@@ -154,9 +151,10 @@ class ScoreLM(nn.Module):
                 hidden_dim=4 * self.model_dim,
                 emb_dim=128,
                 num_heads=self.num_heads,
-                drop_prob=self.dropout_prob
+                dropout_prob=self.dropout_prob
             )
-            for _ in range(num_layers))
+            for _ in range(num_layers)
+        )
 
         self.output = nn.Linear(self.model_dim, self.num_classes)
 
@@ -165,22 +163,20 @@ class ScoreLM(nn.Module):
         e = F.normalize(e, dim=-1) * math.sqrt(self.embedding_dim)
         return e
 
-    def get_logits(self, x):
-        h = self.norm(x)
-        output = self.output(h)
-        return output
-
     def interpolate(self, logits):
         emb_weights = (logits / self.interpolate_temperature).softmax(dim=-1)
         norm_emb = F.normalize(self.embedding.weight, dim=-1) * math.sqrt(self.embedding_dim)
         return emb_weights @ norm_emb
 
-    @staticmethod
-    def self_attention_mask(length_mask):
+    def self_attention_mask(self, length_mask):
         bsz, seqlen = length_mask.shape
-        mask = torch.zeros(bsz, seqlen, seqlen, dtype=torch.bool, device=length_mask.device)
-        mask = mask.masked_fill(length_mask.unsqueeze(1), True)
-        return mask.unsqueeze(1)
+        mask = torch.logical_and(length_mask.view(bsz, 1, 1, seqlen), length_mask.view(bsz, 1, seqlen, 1))
+        return mask.expand(bsz, self.num_heads, seqlen, seqlen)
+
+    def mixed_directional_mask(self, length_mask):
+        mask = self.self_attention_mask(length_mask)
+        cond = (torch.arange(self.num_heads, device=length_mask.device) % 2 == 0).unsqueeze(0)
+        return torch.where(append_dims(cond, mask.ndim), torch.tril(mask), torch.triu(mask))
 
     def forward(self, x, t, length_mask=None, conditioning=None, conditioning_mask=None):
         bsz, seqlen, _ = x.shape
@@ -194,7 +190,7 @@ class ScoreLM(nn.Module):
         if length_mask is None:
             length_mask = torch.ones((bsz, seqlen), dtype=torch.bool, device=x.device)
 
-        attention_mask = self.self_attention_mask(length_mask)
+        attention_mask = self.mixed_directional_mask(length_mask)
 
         emb = self.time_embed(append_dims(t, x.ndim))
         h = self.project(x)
