@@ -87,18 +87,23 @@ class Collate:
         return conditional_mask
 
     def process_ids(self, ids):
-        # Randomly insert into ids
         if self.insert_value >= 0 and self.insert_rate > 0.0:
+            # Randomly insert into ids
             pad_count = int(len(ids) * self.insert_rate)
             pad_indices = random.sample(range(len(ids)), pad_count)
             for index in pad_indices:
                 ids.insert(index, self.insert_value)
 
-        # Random segment of full sequence if too long
         if 0 < self.max_sequence_length < len(ids):
+            # Random segment of full sequence if too long
             start_index = random.randint(0, len(ids) - self.max_sequence_length)
             end_index = start_index + self.max_sequence_length
             ids = ids[start_index:end_index]
+        elif self.random_length_expansion and len(ids) < self.max_sequence_length:
+            # Sample a random amount of padding
+            max_padding_length = self.max_sequence_length - len(ids)
+            random_padding_length = random.randint(0, max_padding_length)
+            ids.extend([self.pad_sequence_value] * random_padding_length)
 
         # Create a conditional mask
         conditioning_mask = self.generate_conditioning_mask(len(ids))
@@ -108,10 +113,6 @@ class Collate:
     def __call__(self, batch):
         processed = list(map(self.process_ids, batch))
         ids, lengths, conditioning_mask = zip(*processed)
-
-        # Sample a random amount of padding
-        padded_lengths = [random.randint(length, max(lengths)) for length in lengths]
-        lengths = torch.tensor(padded_lengths) if self.random_length_expansion else torch.tensor(lengths)
 
         ids = torch.nn.utils.rnn.pad_sequence(
             [torch.tensor(x, dtype=torch.int64) for x in ids],
@@ -124,7 +125,7 @@ class Collate:
             padding_value=False
         )
 
-        length_mask = torch.lt(torch.arange(ids.shape[1]).unsqueeze(0), lengths.unsqueeze(1))
+        length_mask = torch.lt(torch.arange(ids.shape[1]).unsqueeze(0), torch.tensor(lengths).unsqueeze(1))
 
         return ids, length_mask, conditioning_mask
 
