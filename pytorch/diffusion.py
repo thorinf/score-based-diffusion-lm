@@ -1,4 +1,5 @@
 import random
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Tuple, TypeVar, Union
 
 import torch
@@ -7,6 +8,23 @@ import torch.nn as nn
 from utils import append_dims
 
 T = TypeVar('T', float, torch.Tensor)
+
+
+@dataclass
+class ScoreLossResults:
+    loss: torch.Tensor
+    mse: torch.Tensor
+    weighted_mse: torch.Tensor
+    output: torch.Tensor
+
+
+@dataclass
+class CrossEntropyScoreLossResults:
+    loss: torch.Tensor
+    ce: torch.Tensor
+    weighted_ce: torch.Tensor
+    accuracy: torch.Tensor
+    logits: torch.Tensor
 
 
 class MultiStepScoreDiffusion:
@@ -65,7 +83,7 @@ class MultiStepScoreDiffusion:
             model: nn.Module,
             x_target: torch.Tensor,
             **model_kwargs: Any
-    ) -> Dict[str, torch.Tensor]:
+    ) -> ScoreLossResults:
         u_shape = x_target.shape[:1] if random.uniform(0, 1) < 0.5 else x_target.shape[:2]
         u = torch.rand(u_shape, dtype=x_target.dtype, device=x_target.device, requires_grad=False)
         t = self.rho_schedule(u)
@@ -77,13 +95,9 @@ class MultiStepScoreDiffusion:
 
         weights = append_dims(self.loss_weight(t), x_target.ndim)
         mse = (x_target.detach() - model_output) ** 2.0
+        weighted_mse = (weights * mse).mean()
 
-        terms = {}
-        terms["xs_mse"] = mse.mean()
-        terms["mse"] = (weights * mse).mean()
-        terms["loss"] = terms["mse"]
-
-        return terms
+        return ScoreLossResults(loss=weighted_mse, mse=mse, weighted_mse=weighted_mse, output=model_output)
 
     def ce_score_loss(
             self,
@@ -92,8 +106,8 @@ class MultiStepScoreDiffusion:
             ids_target: torch.Tensor,
             ignore_index: int = -100,
             **model_kwargs: Any
-    ) -> Dict[str, torch.Tensor]:
-        u_shape = x_target.shape[:1] if random.uniform(0, 1) < 0.5 else x_target.shape[:2]
+    ) -> CrossEntropyScoreLossResults:
+        u_shape = x_target.shape[:1] if random.uniform(0, 1) < 0.9 else x_target.shape[:2]
         u = torch.rand(u_shape, dtype=x_target.dtype, device=x_target.device, requires_grad=False)
         t = self.rho_schedule(u)
 
@@ -102,18 +116,19 @@ class MultiStepScoreDiffusion:
 
         logits = self.denoise(model, x_t, t, False, **model_kwargs)
 
-        loss = torch.nn.functional.cross_entropy(logits.transpose(1, -1), ids_target, reduction='none',
-                                                 ignore_index=ignore_index)
+        ce = torch.nn.functional.cross_entropy(logits.transpose(1, -1), ids_target, reduction='none',
+                                               ignore_index=ignore_index)
 
-        weight = self.loss_weight(append_dims(t, loss.ndim))
+        weights = self.loss_weight(append_dims(t, ce.ndim))
+        n_elem = (ids_target != ignore_index).sum()
 
-        terms = {}
-        terms["n_elem"] = (ids_target != ignore_index).sum()
-        terms["ce"] = loss.sum() / terms["n_elem"]
-        terms["wce"] = (loss * weight).sum() / terms["n_elem"]
-        terms["loss"] = terms["wce"]
-
-        return terms
+        return CrossEntropyScoreLossResults(
+            loss=(weights * ce).sum() / n_elem,
+            ce=ce.sum() / n_elem,
+            weighted_ce=(weights * ce).sum() / n_elem,
+            accuracy=(logits.argmax(dim=-1) == ids_target).sum() / n_elem,
+            logits=logits
+        )
 
     @torch.no_grad()
     def sample_euler(

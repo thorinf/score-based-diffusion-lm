@@ -154,8 +154,7 @@ class Trainer:
             if self.global_step % self.log_interval == 0:
                 logger.dump_kvs()
             if self.global_step % self.save_interval == 0:
-                pass
-                # self.save()
+                self.save()
             if self.global_step % self.sample_interval == 0:
                 self.sample()
                 logger.info(f"resuming training...")
@@ -182,12 +181,12 @@ class Trainer:
             length_mask = length_mask.to(self.device)
             conditioning_mask = conditioning_mask.to(self.device)
 
-            embeddings = self.model.get_embeddings(ids)
-            loss_mask = torch.logical_and(length_mask, ~conditioning_mask)
-            ids = ids.masked_fill(~loss_mask, -100)
-
             with torch.cuda.amp.autocast(enabled=self.use_fp16):
-                losses = self.diffusion.ce_score_loss(
+                embeddings = self.model.get_embeddings(ids)
+                loss_mask = torch.logical_and(length_mask, ~conditioning_mask)
+                ids = ids.masked_fill(~loss_mask, -100)
+
+                results = self.diffusion.ce_score_loss(
                     model=self.model,
                     x_target=embeddings,
                     ids_target=ids,
@@ -196,12 +195,13 @@ class Trainer:
                     conditioning_mask=conditioning_mask
                 )
 
-            loss = losses["loss"]
+            loss = results.loss
 
-            n_elem = losses["n_elem"].item()
+            n_elem = loss_mask.sum().item()
             logger.log_kv_mean("loss", loss.item(), n_elem)
-            logger.log_kv_mean("ce", losses["ce"].item(), n_elem)
-            logger.log_kv_mean("wce", losses["wce"].item(), n_elem)
+            logger.log_kv_mean("ce", results.ce.item(), n_elem)
+            logger.log_kv_mean("wce", results.weighted_ce.item(), n_elem)
+            logger.log_kv_mean("accuracy", results.accuracy.item(), n_elem)
 
             n_token, n_mask = length_mask.sum().item(), conditioning_mask.sum().item()
             logger.log_kv_mean("n_token", n_token)
