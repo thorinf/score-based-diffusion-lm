@@ -4,7 +4,7 @@ A score-based Diffusion LM approach.
 ## What are the aims of this repository?
 
 Using [simple-diffusion-lm](https://github.com/thorinf/simple-diffusion-lm), this repository attempts a score-based
-approach while keeping code minimal. 
+approach.
 There are some additional design changes, the biggest change is to a multi-level diffusion step - more details below.
 
 ## How to Run:
@@ -63,6 +63,20 @@ There's a bunch of other arguments which can be altered, but above is enough to 
 
 Many of the details in architecture are mirrors of [simple-diffusion-lm](https://github.com/thorinf/simple-diffusion-lm),
 so here only the changes differences will be listed.
+
+### Sequence Packing:
+When training on variable length sequences there can often be redundant computation due to padding of short sequences.
+To combat this, if sequences are sufficiently short they are concatenated together. 
+These concatenated sequences will not be longer than the maximum sequence length for that batch - 
+this max length is capped during training.
+The attention mask is created in the dataloader such that these concatenated sequences do not affect one another.
+
+This increases the number of trainable tokens in each batch:
+
+| Batch Size | Max Length | Packing | Tokens | Efficiency |
+|------------|------------|--------|--------|------------|
+| 128        | 64         | No     | 6820   | 83%        |
+| 128        | 64         | Yes    | 7420   | 90%        |
 
 ### Multi-Level Diffusion:
 One of the main inspirations for this approach is [AR-Diffusion][8]. 

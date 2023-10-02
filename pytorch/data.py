@@ -1,9 +1,10 @@
-import random
+from collections import deque
 from logging import getLogger
+import random
 from typing import List
 
-from sentencepiece import SentencePieceProcessor
 import torch
+from sentencepiece import SentencePieceProcessor
 from torch.utils.data import Dataset
 
 from utils import get_line_offsets
@@ -58,6 +59,27 @@ class TextDataset(torch.utils.data.Dataset):
         return ids
 
 
+class PackedDataLoader(torch.utils.data.DataLoader):
+    def __init__(self, *args, sizing_fn, packed_collate_fn, **kwargs):
+        self.sizing_fn = sizing_fn
+        self.packed_collate_fn = packed_collate_fn
+        super(PackedDataLoader, self).__init__(*args, **kwargs)
+        self.cache = deque()
+
+    def pack_samples(self, samples):
+        sizes = self.sizing_fn(samples)
+        packed_indexes = pack_sizes(sizes)
+        return [[samples[index] for index in sublist] for sublist in packed_indexes]
+
+    def __iter__(self):
+        for samples in super(PackedDataLoader, self).__iter__():
+            self.cache.extend(self.pack_samples(samples))
+
+            while len(self.cache) >= self.batch_size:
+                packed_batch = [self.cache.popleft() for _ in range(self.batch_size)]
+                yield self.packed_collate_fn(packed_batch)
+
+
 class Collate:
     def __init__(
             self,
@@ -75,43 +97,8 @@ class Collate:
         self.insert_value = insert_value
         self.insert_rate = insert_rate
 
-    @staticmethod
-    def generate_conditioning_mask(length):
-        conditional_mask = [False] * length
-        mask_span_length = random.randint(0, length - 1)
-        start_index = random.randint(0, length - mask_span_length)
-        conditional_mask[start_index:start_index + mask_span_length] = [True] * mask_span_length
-        # Half of the masks will be completely random
-        if random.random() < 0.5:
-            random.shuffle(conditional_mask)
-        return conditional_mask
-
-    def process_ids(self, ids):
-        if self.insert_value >= 0 and self.insert_rate > 0.0:
-            # Randomly insert into ids
-            pad_count = int(len(ids) * self.insert_rate)
-            pad_indices = random.sample(range(len(ids)), pad_count)
-            for index in pad_indices:
-                ids.insert(index, self.insert_value)
-
-        if 0 < self.max_sequence_length < len(ids):
-            # Random segment of full sequence if too long
-            start_index = random.randint(0, len(ids) - self.max_sequence_length)
-            end_index = start_index + self.max_sequence_length
-            ids = ids[start_index:end_index]
-        elif self.random_length_expansion and len(ids) < self.max_sequence_length:
-            # Sample a random amount of padding
-            max_padding_length = self.max_sequence_length - len(ids)
-            random_padding_length = random.randint(0, max_padding_length)
-            ids.extend([self.pad_sequence_value] * random_padding_length)
-
-        # Create a conditional mask
-        conditioning_mask = self.generate_conditioning_mask(len(ids))
-
-        return ids, len(ids), conditioning_mask
-
-    def __call__(self, batch):
-        processed = list(map(self.process_ids, batch))
+    def collate_fn(self, batch):
+        processed = list(map(self._process_ids, batch))
         ids, lengths, conditioning_mask = zip(*processed)
 
         ids = torch.nn.utils.rnn.pad_sequence(
@@ -128,6 +115,133 @@ class Collate:
         length_mask = torch.lt(torch.arange(ids.shape[1]).unsqueeze(0), torch.tensor(lengths).unsqueeze(1))
 
         return ids, length_mask, conditioning_mask
+
+    def prepack_fn(self, batch):
+        return list(map(self._process_ids, batch))
+
+    @staticmethod
+    def sizing_fn(batch):
+        return [sample[1] for sample in batch]
+
+    def packed_collate_fn(self, batch):
+        processed = list(map(self._process_packed_samples, batch))
+        ids, lengths, attention_masks, conditioning_masks = zip(*processed)
+
+        ids = torch.nn.utils.rnn.pad_sequence(
+            [torch.tensor(x, dtype=torch.int64) for x in ids],
+            batch_first=True,
+            padding_value=self.pad_sequence_value
+        )
+
+        length_mask = torch.lt(torch.arange(ids.shape[1]).unsqueeze(0), torch.tensor(lengths).unsqueeze(1))
+
+        max_size = max(len(mask) for mask in attention_masks)
+
+        def pad_tensor(t, target_size):
+            padding_size = target_size - t.size(0)
+            return torch.nn.functional.pad(t, (0, padding_size, 0, padding_size))
+
+        attention_mask = torch.nn.utils.rnn.pad_sequence(
+            [pad_tensor(torch.tensor(mask, dtype=torch.bool), max_size) for mask in attention_masks],
+            batch_first=True,
+            padding_value=False
+        ).unsqueeze(1)
+
+        conditioning_mask = torch.nn.utils.rnn.pad_sequence(
+            [torch.tensor(x, dtype=torch.bool) for x in conditioning_masks],
+            batch_first=True,
+            padding_value=False
+        )
+
+        return ids, length_mask, attention_mask, conditioning_mask
+
+    def _process_ids(self, ids):
+        ids = self._crop_augment_ids(ids)
+        conditioning_mask = self._gen_conditioning_mask(len(ids))
+        return ids, len(ids), conditioning_mask
+
+    def _crop_augment_ids(self, ids):
+        if self.insert_value >= 0 and self.insert_rate > 0.0:
+            ids = self._pad_insert(ids)
+        if 0 < self.max_sequence_length < len(ids):
+            ids = self._random_crop(ids)
+        elif self.random_length_expansion and len(ids) < self.max_sequence_length:
+            ids = self._expand_length(ids)
+        return ids
+
+    def _pad_insert(self, ids):
+        # Randomly insert into ids
+        pad_count = int(len(ids) * self.insert_rate)
+        pad_indices = random.sample(range(len(ids)), pad_count)
+        for index in pad_indices:
+            ids.insert(index, self.insert_value)
+        return ids
+
+    def _random_crop(self, ids):
+        # Random segment of full sequence if too long
+        start_index = random.randint(0, len(ids) - self.max_sequence_length)
+        end_index = start_index + self.max_sequence_length
+        ids = ids[start_index:end_index]
+        return ids
+
+    def _expand_length(self, ids):
+        # Sample a random amount of padding
+        max_padding_length = self.max_sequence_length - len(ids)
+        random_padding_length = random.randint(0, max_padding_length)
+        ids.extend([self.pad_sequence_value] * random_padding_length)
+        return ids
+
+    @staticmethod
+    def _gen_conditioning_mask(length):
+        conditional_mask = [False] * length
+        mask_span_length = random.randint(0, length - 1)
+        start_index = random.randint(0, length - mask_span_length)
+        conditional_mask[start_index:start_index + mask_span_length] = [True] * mask_span_length
+        # Half of the masks will be completely random
+        if random.random() < 0.5:
+            random.shuffle(conditional_mask)
+        return conditional_mask
+
+    @staticmethod
+    def _process_packed_samples(packed_samples):
+        packed_ids, packed_lengths, packed_conditioning_masks = zip(*packed_samples)
+
+        ids = [item for sublist in packed_ids for item in sublist]
+        flattened_conditioning_mask = [item for sublist in packed_conditioning_masks for item in sublist]
+        attention_mask = packed_mask(packed_lengths)
+        return ids, sum(packed_lengths), attention_mask, flattened_conditioning_mask
+
+
+def pack_sizes(sizes):
+    max_size = max(sizes)
+    sorted_indices = sorted(range(len(sizes)), key=sizes.__getitem__, reverse=True)
+
+    bins = []
+    bin_sums = {}
+
+    for index in sorted_indices:
+        size = sizes[index]
+        for b, total in bin_sums.items():
+            if total + size <= max_size:
+                bins[b].append(index)
+                bin_sums[b] += size
+                break
+        else:
+            bin_id = len(bins)
+            bins.append([index])
+            bin_sums[bin_id] = size
+
+    return bins
+
+
+def packed_mask(lengths):
+    mask = []
+    for l in lengths:
+        row = []
+        for ll in lengths:
+            row.extend([1 if ll == l else 0] * ll)
+        mask.extend([row] * l)
+    return mask
 
 
 def infinite_loader(dataloader: torch.utils.data.DataLoader):

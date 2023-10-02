@@ -2,8 +2,7 @@ import argparse
 import os
 import json
 import logger
-from data import SentencePieceTokenizer, TextDataset, Collate, infinite_loader
-from torch.utils.data import DataLoader
+from data import SentencePieceTokenizer, TextDataset, PackedDataLoader, Collate, infinite_loader
 from model import ScoreLM
 from diffusion import MultiStepScoreDiffusion
 from trainer import Trainer
@@ -62,14 +61,17 @@ def main():
         insert_rate=0.0
     )
 
-    dataloader = DataLoader(
+    dataloader = PackedDataLoader(
         dataset,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=1,
         pin_memory=False,
-        collate_fn=collate
+        collate_fn=collate.prepack_fn,
+        sizing_fn=collate.sizing_fn,
+        packed_collate_fn=collate.packed_collate_fn
     )
+
     dataloader = infinite_loader(dataloader)
 
     conditional_starts = get_text("conditional_starts.txt")
@@ -104,7 +106,7 @@ def create_argparser():
     parser.add_argument('-bsz', '--batch_size', type=int, default=128)
     parser.add_argument('-acc', '--accumulation_steps', type=int, default=1)
     parser.add_argument('-svi', '--log_interval', type=int, default=50)
-    parser.add_argument('-lgi', '--save_interval', type=int, default=1000)
+    parser.add_argument('-lgi', '--save_interval', type=int, default=5000)
     parser.add_argument('-smi', '--sample_interval', type=int, default=10000)
 
     parser.add_argument('-edim', '--embedding_dim', type=int, default=256)

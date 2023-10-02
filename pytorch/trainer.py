@@ -175,10 +175,11 @@ class Trainer:
     def forward_backward(self):
         self.opt.zero_grad()
         for _ in range(self.accumulation_steps):
-            ids, length_mask, conditioning_mask = next(self.data)
+            ids, length_mask, attention_mask, conditioning_mask = next(self.data)
 
             ids = ids.to(self.device)
             length_mask = length_mask.to(self.device)
+            attention_mask = attention_mask.to(self.device)
             conditioning_mask = conditioning_mask.to(self.device)
 
             with torch.cuda.amp.autocast(enabled=self.use_fp16):
@@ -191,6 +192,7 @@ class Trainer:
                     x_target=embeddings,
                     ids_target=ids,
                     length_mask=length_mask,
+                    attention_mask=attention_mask,
                     conditioning=embeddings,
                     conditioning_mask=conditioning_mask
                 )

@@ -173,12 +173,7 @@ class ScoreLM(nn.Module):
         mask = torch.logical_and(length_mask.view(bsz, 1, 1, seqlen), length_mask.view(bsz, 1, seqlen, 1))
         return mask.expand(bsz, self.num_heads, seqlen, seqlen)
 
-    def mixed_directional_mask(self, length_mask):
-        mask = self.self_attention_mask(length_mask)
-        cond = (torch.arange(self.num_heads, device=length_mask.device) % 2 == 0).unsqueeze(0)
-        return torch.where(append_dims(cond, mask.ndim), torch.tril(mask), torch.triu(mask))
-
-    def forward(self, x, t, length_mask=None, conditioning=None, conditioning_mask=None):
+    def forward(self, x, t, length_mask=None, attention_mask=None, conditioning=None, conditioning_mask=None):
         bsz, seqlen, _ = x.shape
 
         t = append_dims(t, x.ndim)
@@ -189,8 +184,8 @@ class ScoreLM(nn.Module):
 
         if length_mask is None:
             length_mask = torch.ones((bsz, seqlen), dtype=torch.bool, device=x.device)
-
-        attention_mask = self.mixed_directional_mask(length_mask)
+        if attention_mask is None:
+            attention_mask = self.self_attention_mask(length_mask)
 
         emb = self.time_embed(append_dims(t, x.ndim))
         h = self.project(x)
