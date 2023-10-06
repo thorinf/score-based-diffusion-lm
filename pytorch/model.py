@@ -11,18 +11,17 @@ from utils import append_dims
 
 
 class MultiHeadAttention(nn.Module):
-    def __init__(self, dim, num_heads, qkv_bias=True, rotary_embedding=None, dropout_prob=0.0):
+    def __init__(self, dim, num_heads, head_dim=None, rotary_embedding=None):
         super(MultiHeadAttention, self).__init__()
         assert (dim % num_heads == 0)
-        self.model_dim = dim
-        self.head_dim = dim // num_heads
+        self.dim = dim
         self.num_heads = num_heads
-        self.dropout_prob = dropout_prob
+        self.head_dim = head_dim if head_dim else dim // num_heads
 
-        self.w_q = nn.Linear(dim, dim, bias=qkv_bias)
-        self.w_k = nn.Linear(dim, dim, bias=qkv_bias)
-        self.w_v = nn.Linear(dim, dim, bias=qkv_bias)
-        self.w_o = nn.Linear(dim, dim)
+        self.w_q = nn.Linear(self.dim, self.num_heads * self.head_dim, bias=False)
+        self.w_k = nn.Linear(self.dim, self.num_heads * self.head_dim, bias=False)
+        self.w_v = nn.Linear(self.dim, self.num_heads * self.head_dim, bias=False)
+        self.w_o = nn.Linear(self.num_heads * self.head_dim, self.dim, bias=False)
 
         self.rotary_emb = rotary_embedding
 
@@ -45,9 +44,8 @@ class MultiHeadAttention(nn.Module):
             k = self.rotary_emb.rotate_queries_or_keys(k)
 
         with torch.backends.cuda.sdp_kernel(enable_flash=True):
-            dropout_p = self.dropout_prob if self.training else 0.0
             mask = torch.where(mask, torch.tensor(0.0), torch.tensor(-1e4))
-            output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=dropout_p)
+            output = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
 
         # score = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(self.head_dim))
         # if mask is not None:
@@ -59,6 +57,20 @@ class MultiHeadAttention(nn.Module):
         return self.w_o(output)
 
 
+class FeedForward(nn.Module):
+    def __init__(self, dim, hidden_dim):
+        super(FeedForward, self).__init__()
+        self.dim = dim
+        self.hidden_dim = hidden_dim
+
+        self.w_1 = nn.Linear(self.dim, self.hidden_dim, bias=False)
+        self.w_2 = nn.Linear(self.hidden_dim, self.dim, bias=False)
+        self.w_3 = nn.Linear(self.dim, self.hidden_dim, bias=False)
+
+    def forward(self, x):
+        return self.w_2(F.silu(self.w_1(x)) * self.w_3(x))
+
+
 class TransformerEncoderLayer(nn.Module):
     def __init__(self, dim, hidden_dim, emb_dim, num_heads=8, dropout_prob=0.0):
         super(TransformerEncoderLayer, self).__init__()
@@ -67,18 +79,12 @@ class TransformerEncoderLayer(nn.Module):
         self.attention = MultiHeadAttention(
             dim=dim,
             num_heads=num_heads,
-            qkv_bias=True,
             rotary_embedding=RotaryEmbedding(dim=dim // (num_heads * 2)),
-            dropout_prob=dropout_prob
         )
         self.dropout1 = nn.Dropout(p=dropout_prob)
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False)
         self.emb2 = nn.Linear(emb_dim, 2 * dim)
-        self.ffn = nn.Sequential(
-            nn.Linear(dim, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, dim),
-        )
+        self.ffn = FeedForward(dim, hidden_dim)
         self.dropout2 = nn.Dropout(p=dropout_prob)
 
     def forward(self, x, emb, mask=None):
@@ -101,7 +107,7 @@ class LearnedSinusoidalPosEmb(nn.Module):
         super(LearnedSinusoidalPosEmb, self).__init__()
         assert (dim % 2) == 0
         half_dim = dim // 2
-        self.weights = nn.Parameter(torch.randn(half_dim))
+        self.weights = nn.Parameter(torch.randn(half_dim), requires_grad=False)
 
     def forward(self, x):
         freq = x @ self.weights.unsqueeze(0) * 2 * math.pi
