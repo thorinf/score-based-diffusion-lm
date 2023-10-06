@@ -67,17 +67,14 @@ class PackedDataLoader(torch.utils.data.DataLoader):
         self.cache = deque()
 
     def pack_samples(self, samples):
-        sizes = self.sizing_fn(samples)
-        packed_indexes = pack_sizes(sizes)
+        packed_indexes = pack_sizes(self.sizing_fn(samples))
         return [[samples[index] for index in sublist] for sublist in packed_indexes]
 
     def __iter__(self):
         for samples in super(PackedDataLoader, self).__iter__():
             self.cache.extend(self.pack_samples(samples))
-
             while len(self.cache) >= self.batch_size:
-                packed_batch = [self.cache.popleft() for _ in range(self.batch_size)]
-                yield self.packed_collate_fn(packed_batch)
+                yield self.packed_collate_fn([self.cache.popleft() for _ in range(self.batch_size)])
 
 
 class Collate:
@@ -214,22 +211,18 @@ class Collate:
 
 def pack_sizes(sizes):
     max_size = max(sizes)
-    sorted_indices = sorted(range(len(sizes)), key=sizes.__getitem__, reverse=True)
-
-    bins = []
-    bin_sums = {}
+    sorted_indices = sorted(range(len(sizes)), key=lambda k: sizes[k], reverse=True)
+    bins, bin_sums = [], {}
 
     for index in sorted_indices:
-        size = sizes[index]
         for b, total in bin_sums.items():
-            if total + size <= max_size:
+            if total + sizes[index] <= max_size:
                 bins[b].append(index)
-                bin_sums[b] += size
+                bin_sums[b] += sizes[index]
                 break
         else:
-            bin_id = len(bins)
             bins.append([index])
-            bin_sums[bin_id] = size
+            bin_sums[len(bins) - 1] = sizes[index]
 
     return bins
 
