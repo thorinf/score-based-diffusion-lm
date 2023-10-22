@@ -10,8 +10,6 @@ import json
 from collections import defaultdict
 import logging
 
-import wandb
-
 DEBUG = 10
 INFO = 20
 WARN = 30
@@ -117,6 +115,7 @@ class JSONOutputFormat(KVWriter):
 
 class CSVOutputFormat(KVWriter):
     def __init__(self, filename, overwrite=True):
+        NotImplementedError("CSV Output Formatter is not recommended due to creating large file sizes.")
         mode = 'w+t' if overwrite else 'a+t'
         self.file = open(filename, mode)
         self.keys = []
@@ -153,18 +152,47 @@ class CSVOutputFormat(KVWriter):
         self.file.close()
 
 
-class WandBOutputFormat(KVWriter):
-    def __init__(self):
-        pass
+class TensorBoardOutputFormat(KVWriter):
+    def __init__(self, log_dir):
+        self.writer = None
+        try:
+            from torch.utils.tensorboard import SummaryWriter
+            os.makedirs(log_dir, exist_ok=True)
+            self.writer = SummaryWriter(log_dir)
+        except ImportError:
+            error("Unable to import tensorboard. Please ensure it's installed and available.")
+            pass
 
     def write_kvs(self, kvs):
         data = kvs.copy()
         step = data.pop("step", None)
-        if wandb.run is not None:
-            wandb.log(kvs, step=step)
+        if self.writer:
+            for k, v in data.items():
+                self.writer.add_scalar(f"logger/{k}", v, step)
+
+    def close(self):
+        self.writer.close()
+
+
+class WandBOutputFormat(KVWriter):
+    def __init__(self):
+        self.wandb = None
+        try:
+            import wandb
+            self.wandb = wandb
+        except ImportError:
+            error("Unable to import wandb. Please ensure it's installed and available.")
+            pass
+
+    def write_kvs(self, kvs):
+        data = kvs.copy()
+        step = data.pop("step", None)
+        if self.wandb and self.wandb.run is not None:
+            self.wandb.log(kvs, step=step)
 
 
 class Logger(object):
+    DEFAULT = None
     CURRENT = None
 
     def __init__(self, output_dir, output_formats):
@@ -211,11 +239,15 @@ class RedirectLoggingHandler(logging.Handler):
 
 
 def configure_pylogging_handler():
-    logger = logging.getLogger()
-    logger.setLevel(logging.DEBUG)
+    pylogger = logging.getLogger()
+    pylogger.setLevel(logging.DEBUG)
     redirect_handler = RedirectLoggingHandler()
-    logger.addHandler(redirect_handler)
-    logger.info("redirecting to custom logger")
+    for h in pylogger.handlers:
+        if isinstance(h, type(redirect_handler)):
+            # this logger already has a handler of this type, so don't add another
+            return
+    pylogger.addHandler(redirect_handler)
+    pylogger.info("redirecting to custom logger")
 
 
 def configure(output_dir, overwrite=False):
@@ -223,12 +255,19 @@ def configure(output_dir, overwrite=False):
         HumanOutputFormat(sys.stdout),
         HumanOutputFormat(osp.join(output_dir, "log.txt"), overwrite=overwrite),
         JSONOutputFormat(osp.join(output_dir, "log.json"), overwrite=overwrite),
-        CSVOutputFormat(osp.join(output_dir, "log.csv"), overwrite=overwrite),
-        WandBOutputFormat()
+        WandBOutputFormat(),
+        TensorBoardOutputFormat(osp.join(output_dir, "tensorboard"))
     ]
 
     Logger.CURRENT = Logger(output_dir=output_dir, output_formats=output_formats)
 
+    configure_pylogging_handler()
+
+
+def _configure_default_logger():
+    output_formats = [HumanOutputFormat(sys.stdout)]
+    Logger.CURRENT = Logger(output_dir=None, output_formats=output_formats)
+    Logger.DEFAULT = Logger.CURRENT
     configure_pylogging_handler()
 
 
@@ -270,4 +309,7 @@ def dump_kvs(step=None):
 
 
 def get_current():
+    if Logger.CURRENT is None:
+        _configure_default_logger()
+
     return Logger.CURRENT
