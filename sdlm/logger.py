@@ -115,37 +115,45 @@ class JSONOutputFormat(KVWriter):
 
 class CSVOutputFormat(KVWriter):
     def __init__(self, filename, overwrite=True):
-        NotImplementedError("CSV Output Formatter is not recommended due to creating large file sizes.")
-        mode = 'w+t' if overwrite else 'a+t'
-        self.file = open(filename, mode)
+        self.file = open(filename, "a+")
         self.keys = []
-        self.sep = ','
+        self.sep = ","
 
-        if not overwrite:
+        if overwrite:
+            self.file.seek(0)
+            self.file.truncate()
+        else:
             self.file.seek(0)
             header = self.file.readline().strip()
             if header:
                 self.keys = header.split(self.sep)
 
     def write_kvs(self, kvs):
-        extra_keys = sorted(list(kvs.keys() - self.keys))
+        new_keys = sorted(list(kvs.keys() - self.keys))
 
-        if extra_keys:
-            self.keys.extend(extra_keys)
+        if new_keys:
+            self.keys.extend(new_keys)
             self.file.seek(0)
             lines = self.file.readlines()
+
+            header = self.sep.join(self.keys) + '\n'
+            if lines:
+                lines[0] = header
+            else:
+                lines = [header]
+
+            num_keys = len(self.keys)
+            for i in range(1, len(lines)):
+                values = lines[i].strip().split(self.sep)
+                lines[i] = self.sep.join(values + [""] * (num_keys - len(values))) + '\n'
+
+            # a crash between truncate and writing will lose csv data
             self.file.seek(0)
-
-            self.file.write(self.sep.join(self.keys) + '\n')
-
-            for line in lines[1:]:
-                padding = ["" for _ in extra_keys]
-                updated_line = line.strip() + self.sep + self.sep.join(padding) + '\n'
-                self.file.write(updated_line)
+            self.file.truncate()
+            self.file.writelines(lines)
 
         values = [str(kvs.get(key, "")) for key in self.keys]
         self.file.write(self.sep.join(values) + '\n')
-
         self.file.flush()
 
     def close(self):
