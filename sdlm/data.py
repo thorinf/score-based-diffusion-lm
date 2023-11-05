@@ -7,7 +7,7 @@ import torch
 from sentencepiece import SentencePieceProcessor
 from torch.utils.data import Dataset
 
-from utils import get_line_offsets
+from .utils import get_line_offsets
 
 logger = getLogger()
 
@@ -21,7 +21,7 @@ class SentencePieceTokenizer:
         self.bos_id: int = self.sp_model.bos_id()
         self.eos_id: int = self.sp_model.eos_id()
         self.pad_id: int = self.sp_model.pad_id()
-        logger.info(f"Vocab Size: {self.num_words:,}")
+        logger.info(f"Vocab Size: {len(self):,}")
         assert self.sp_model.vocab_size() == self.sp_model.get_piece_size()
 
     def __len__(self):

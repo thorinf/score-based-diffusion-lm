@@ -1,19 +1,17 @@
-import os
 import os.path as osp
-import time
 
 import numpy as np
 import torch
 from unidecode import unidecode
 
-from utils import (
+from . import logger
+from .utils import (
     get_named_float_tensors,
     get_weight_decay_parameters,
     update_ema_parameters,
     compute_anisotropy,
     cosine_decay_with_warmup
 )
-import logger
 
 INITIAL_LOG_LOSS_SCALE = 20.0
 
@@ -175,15 +173,10 @@ class Trainer:
     def forward_backward(self):
         self.opt.zero_grad()
         for _ in range(self.accumulation_steps):
-            ids, length_mask, attention_mask, conditioning_mask = next(self.data)
-
-            ids = ids.to(self.device)
-            length_mask = length_mask.to(self.device)
-            attention_mask = attention_mask.to(self.device)
-            conditioning_mask = conditioning_mask.to(self.device)
+            ids, length_mask, attention_mask, conditioning_mask = [tensor.to(self.device) for tensor in next(self.data)]
 
             with torch.cuda.amp.autocast(enabled=self.use_fp16):
-                embeddings = self.model.get_embeddings(ids)
+                embeddings = self.model.embed(ids)
                 loss_mask = torch.logical_and(length_mask, ~conditioning_mask)
                 ids = ids.masked_fill(~loss_mask, -100)
 
@@ -309,7 +302,7 @@ class Trainer:
     def sample(self):
         self.model.eval()
         conditioning_ids, conditioning_mask = self.prepare_conditioning()
-        conditioning = self.model.get_embeddings(conditioning_ids)
+        conditioning = self.model.embed(conditioning_ids)
 
         z = torch.randn((*conditioning_mask.size(), self.model.embedding_dim), device=self.device)
         us = torch.arange(self.sample_iterations, device=z.device) / (self.sample_iterations - 1)

@@ -1,12 +1,12 @@
 import argparse
 import os
 import json
-import logger
-from data import SentencePieceTokenizer, TextDataset, PackedDataLoader, Collate, infinite_loader
-from model import ScoreLM
-from diffusion import MultiStepScoreDiffusion
-from trainer import Trainer
-from utils import get_text
+from sdlm import logger
+from sdlm.data import SentencePieceTokenizer, TextDataset, PackedDataLoader, Collate, infinite_loader
+from sdlm.model import ScoreLM
+from sdlm.diffusion import MultiStepScoreDiffusion
+from sdlm.trainer import Trainer
+from sdlm.utils import get_text
 import wandb
 
 
@@ -74,7 +74,7 @@ def main():
 
     dataloader = infinite_loader(dataloader)
 
-    conditional_starts = get_text("conditional_starts.txt")
+    conditional_starts = get_text("../sdlm/conditional_starts.txt")
 
     trainer = Trainer(
         model=model,
@@ -119,7 +119,7 @@ def create_argparser():
     parser.add_argument('-lr', '--learning_rate', type=float, default=1e-4)
     parser.add_argument('-wus', '--warmup_steps', type=int, default=3e4)
     parser.add_argument('-hp', '--use_fp16', type=bool, default=False)
-    parser.add_argument('-wd', '--weight_decay', type=float, default=0.1)
+    parser.add_argument('-wd', '--weight_decay', type=float, default=0.0)
     parser.add_argument('-gc', '--gradient_clipping', type=float, default=1.0)
     parser.add_argument('-ema', '--ema_rate', default="0.95, 0.9999")
 
@@ -132,6 +132,7 @@ def create_argparser():
     parser.add_argument('-mdir', '--model_dir', type=str, required=True)
     parser.add_argument('-d', '--data_path', type=str, required=True)
     parser.add_argument('-spm', '--spm_model', type=str, required=True)
+
     return parser
 
 

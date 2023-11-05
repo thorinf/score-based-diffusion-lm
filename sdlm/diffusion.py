@@ -1,11 +1,11 @@
 import random
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Tuple, TypeVar, Union
+from typing import Any, Callable, List, Tuple, TypeVar, Union
 
 import torch
 import torch.nn as nn
 
-from utils import append_dims
+from .utils import append_dims
 
 T = TypeVar('T', float, torch.Tensor)
 
@@ -84,7 +84,7 @@ class MultiStepScoreDiffusion:
             x_target: torch.Tensor,
             **model_kwargs: Any
     ) -> ScoreLossResults:
-        u_shape = x_target.shape[:1] if random.uniform(0, 1) < 0.5 else x_target.shape[:2]
+        u_shape = x_target.shape[:1] if random.uniform(0, 1) < 1.0 else x_target.shape[:2]
         u = torch.rand(u_shape, dtype=x_target.dtype, device=x_target.device, requires_grad=False)
         t = self.rho_schedule(u)
 
@@ -107,7 +107,7 @@ class MultiStepScoreDiffusion:
             ignore_index: int = -100,
             **model_kwargs: Any
     ) -> CrossEntropyScoreLossResults:
-        u_shape = x_target.shape[:1] if random.uniform(0, 1) < 0.9 else x_target.shape[:2]
+        u_shape = x_target.shape[:1] if random.uniform(0, 1) < 1.0 else x_target.shape[:2]
         u = torch.rand(u_shape, dtype=x_target.dtype, device=x_target.device, requires_grad=False)
         t = self.rho_schedule(u)
 
@@ -123,7 +123,7 @@ class MultiStepScoreDiffusion:
         n_elem = (ids_target != ignore_index).sum()
 
         return CrossEntropyScoreLossResults(
-            loss=(weights * ce).sum() / n_elem,
+            loss=ce.sum() / n_elem,
             ce=ce.sum() / n_elem,
             weighted_ce=(weights * ce).sum() / n_elem,
             accuracy=(logits.argmax(dim=-1) == ids_target).sum() / n_elem,
