@@ -51,10 +51,7 @@ class HumanOutputFormat(SeqWriter, KVWriter):
     def write_kvs(self, kvs):
         key2str = {}
         for key, val in kvs.items():
-            if isinstance(val, (int, float)):
-                valstr = f"{val:<8.3g}"
-            else:
-                valstr = str(val)
+            valstr = f"{val:<8.3g}" if isinstance(val, float) else str(val)
             key2str[self._truncate(key)] = self._truncate(valstr)
 
         if not key2str:
@@ -106,6 +103,7 @@ class JSONOutputFormat(KVWriter):
         for k, v in sorted(kvs.items()):
             if hasattr(v, "dtype"):
                 kvs[k] = float(v)
+
         self.file.write(json.dumps(kvs) + "\n")
         self.file.flush()
 
@@ -252,24 +250,37 @@ def configure_pylogging_handler():
     redirect_handler = RedirectLoggingHandler()
     for h in pylogger.handlers:
         if isinstance(h, type(redirect_handler)):
-            # this logger already has a handler of this type, so don't add another
+            # handler of this type already exists, prevent duplicating redirects
             return
     pylogger.addHandler(redirect_handler)
     pylogger.info("redirecting to custom logger")
 
 
-def configure(output_dir, overwrite=False):
-    output_formats = [
-        HumanOutputFormat(sys.stdout),
-        HumanOutputFormat(osp.join(output_dir, "log.txt"), overwrite=overwrite),
-        JSONOutputFormat(osp.join(output_dir, "log.json"), overwrite=overwrite),
-        WandBOutputFormat(),
-        TensorBoardOutputFormat(osp.join(output_dir, "tensorboard"))
-    ]
+def configure(output_dir, log_suffix="", overwrite=False):
+    format_refs = os.getenv("LOGGING_FORMATS", "stdout,log,csv,wandb").split(",")
+    output_formats = [get_output_format(f, output_dir, log_suffix, overwrite) for f in format_refs]
 
     Logger.CURRENT = Logger(output_dir=output_dir, output_formats=output_formats)
-
+    log(f"logging to {output_dir}")
     configure_pylogging_handler()
+
+
+def get_output_format(format_ref, output_dir, log_suffix="", overwrite=False):
+    os.makedirs(output_dir, exist_ok=True)
+    if format_ref == "stdout":
+        return HumanOutputFormat(sys.stdout)
+    elif format_ref == "log":
+        return HumanOutputFormat(osp.join(output_dir, "log%s.txt" % log_suffix), overwrite=overwrite)
+    elif format_ref == "json":
+        return JSONOutputFormat(osp.join(output_dir, "progress%s.json" % log_suffix), overwrite=overwrite)
+    elif format_ref == "csv":
+        return CSVOutputFormat(osp.join(output_dir, "progress%s.csv" % log_suffix), overwrite=overwrite)
+    elif format_ref == "tensorboard":
+        return TensorBoardOutputFormat(osp.join(output_dir, "tb%s" % log_suffix))
+    elif format_ref == "wandb":
+        return WandBOutputFormat()
+    else:
+        raise ValueError(f"Unknown format specified: {format_ref}")
 
 
 def _configure_default_logger():
