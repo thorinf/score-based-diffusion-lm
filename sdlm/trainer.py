@@ -62,16 +62,14 @@ class Trainer:
         self.warmup_steps = warmup_steps
         self.weight_decay = weight_decay
         self.gradient_clipping = gradient_clipping
-
-        self.global_step = 0
         self.max_updates = 1e6
+        self.global_step = 0
+        self.log_loss_scale = INITIAL_LOG_LOSS_SCALE
 
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
         self.model.to(self.device)
         self.load_model_checkpoint()
-
-        self.log_loss_scale = INITIAL_LOG_LOSS_SCALE
 
         decay, no_decay = get_weight_decay_parameters(self.model)
         optim_groups = [
@@ -167,8 +165,8 @@ class Trainer:
         else:
             self.optimise()
         self.update_ema_parameters()
-        self.log_anisotropy()
-        self.log_step()
+        self._log_anisotropy()
+        self._log_step()
 
     def forward_backward(self):
         self.opt.zero_grad()
@@ -202,85 +200,95 @@ class Trainer:
             logger.log_kv_mean("n_token", n_token)
             logger.log_kv_mean("p_mask", n_mask / n_token, n_token)
 
-            if self.use_fp16:
-                loss_scale = 2 ** self.log_loss_scale
-                (loss * loss_scale).backward()
-            else:
-                loss.backward()
-
     def optimise(self):
-        n_loss_elem = getattr(self, "n_loss_elem", self.accumulation_steps)
-        if hasattr(self, "n_loss_elem"):
-            setattr(self, "n_loss_elem", 0)
+        n_loss_elem = self._get_n_loss_elem()
 
         if n_loss_elem == 0:
             logger.error("tried to optimize, but number of elements in loss was 0")
             return
 
-        self.scale_grads(1.0 / n_loss_elem)
-        self.log_grad_norm()
-        self.update_lr()
+        self._scale_grads(1.0 / n_loss_elem)
+        self._log_norms()
+        self._anneal_lr()
         if self.gradient_clipping > 0:
-            self.grad_clip()
+            self._grad_clip()
         self.opt.step()
         self.global_step += 1
 
     def optimize_fp16(self):
-        n_loss_elem = getattr(self, "n_loss_elem", self.accumulation_steps)
-        if hasattr(self, "n_loss_elem"):
-            setattr(self, "n_loss_elem", 0)
-
-        if n_loss_elem == 0:
-            logger.log("tried to optimize, but number of elements in loss was 0")
-            return
-
-        if not self.grad_is_finite():
+        if not self._grad_is_finite():
+            # In a DistributedDataParallel (DDP) setting, gradients are synchronized,
+            # so scaling (and consequently weight updates) should be consistent across all ranks.
             self.log_loss_scale -= 1
             logger.log(f"found NaN, decreased log_loss_scale to {self.log_loss_scale}")
             return
 
-        self.scale_grads(1.0 / (n_loss_elem * (2 ** self.log_loss_scale)))
-        self.log_grad_norm()
-        self.update_lr()
+        n_loss_elem = self._get_n_loss_elem()
+        if n_loss_elem == 0:
+            logger.log("tried to optimize, but number of elements in loss was 0")
+            return
+
+        self._scale_grads(1.0 / (n_loss_elem * (2 ** self.log_loss_scale)))
+        self._log_norms()
+        self._anneal_lr()
         if self.gradient_clipping > 0:
-            self.grad_clip()
+            self._grad_clip()
         self.opt.step()
         self.log_loss_scale += self.fp16_scale_growth
         self.global_step += 1
 
-    def grad_is_finite(self):
-        for param in self.model.parameters():
-            if param.grad is not None:
-                if not torch.isfinite(param.grad).all():
+    def _grad_is_finite(self):
+        for p in self.model.parameters():
+            if p.grad is not None:
+                if not torch.isfinite(p.grad).all():
                     return False
         return True
 
-    def scale_grads(self, scale):
-        for param in self.model.parameters():
-            if param.grad is not None:
-                param.grad.data.mul_(scale)
-
-    def grad_clip(self):
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clipping)
-
-    def log_grad_norm(self):
-        sq_sum = 0.0
+    def _scale_grads(self, scale):
         for p in self.model.parameters():
-            if not p.requires_grad:
-                continue
-            sq_sum += (p.grad ** 2).sum().item()
-        logger.log_kv_mean("grad_norm", np.sqrt(sq_sum))
+            if p.grad is not None:
+                p.grad.mul_(scale)
 
-    def update_lr(self):
+    def _grad_clip(self):
+        if hasattr(self.opt, "clip_grad_norm"):
+            # Some optimizers have a specific way to do gradient clipping.
+            self.opt.clip_grad_norm(self.gradient_clipping)
+        else:
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clipping)
+
+    def _get_n_loss_elem(self):
+        # The number of 'loss elements' can optionally be set during forward-backward.
+        # If used, the loss for computing the backward pass should be the sum of the loss, not the mean.
+        # Scaling the gradients by this value later is typically equivalent to taking the mean.
+        # Specifying the number of loss elements is useful when various elements contribute to the overall loss,
+        # preventing smaller batches from disproportionately affecting weight updates.
+        # For scenarios with multiple accumulation steps, sum the number loss elements across iterations.
+        n_loss_elem = torch.tensor(getattr(self, "n_loss_elem", self.accumulation_steps)).float()
+        if hasattr(self, "n_loss_elem"):
+            setattr(self, "n_loss_elem", 0)
+
+        return n_loss_elem
+
+    def _log_norms(self):
+        grad_sq_sum = 0.0
+        param_sq_sum = 0.0
+        for p in self.model.parameters():
+            param_sq_sum += (p ** 2).sum().item()
+            if p.grad is not None:
+                grad_sq_sum += (p.grad ** 2).sum().item()
+        logger.log_kv_mean("grad_norm", np.sqrt(grad_sq_sum))
+        logger.log_kv_mean("param_norm", np.sqrt(param_sq_sum))
+
+    def _anneal_lr(self):
         lr = cosine_decay_with_warmup(self.global_step, self.learning_rate, int(self.warmup_steps),
                                       int(self.max_updates))
         [param_group.update({"lr": lr}) for param_group in self.opt.param_groups]
         logger.log_kv("lr", lr)
 
-    def log_anisotropy(self):
+    def _log_anisotropy(self):
         logger.log_kv("anisotropy", compute_anisotropy(self.model.embedding.weight).item())
 
-    def log_step(self):
+    def _log_step(self):
         logger.log_kv("step", self.global_step)
         if self.use_fp16:
             logger.log_kv("log_loss_scale", self.log_loss_scale)
