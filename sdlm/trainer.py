@@ -174,28 +174,49 @@ class Trainer:
             ids, length_mask, attention_mask, conditioning_mask = [tensor.to(self.device) for tensor in next(self.data)]
 
             with torch.cuda.amp.autocast(enabled=self.use_fp16):
-                embeddings = self.model.embed(ids)
-                loss_mask = torch.logical_and(length_mask, ~conditioning_mask)
-                ids = ids.masked_fill(~loss_mask, -100)
+                encoded = self.model.encode(ids)
 
-                results = self.diffusion.ce_score_loss(
+                output = self.diffusion.forward_reverse(
                     model=self.model,
-                    x_target=embeddings,
-                    ids_target=ids,
+                    x_target=encoded,
                     length_mask=length_mask,
                     attention_mask=attention_mask,
-                    conditioning=embeddings,
+                    conditioning=encoded,
                     conditioning_mask=conditioning_mask
                 )
 
-            loss = results.loss
+                logits = self.model.decode(output)
 
-            n_elem = loss_mask.sum().item()
+                loss_mask = torch.logical_and(length_mask, ~conditioning_mask)
+                ids = ids.masked_fill(~loss_mask, -100)
+                n_elem = loss_mask.sum()
+
+                mse = (((output - encoded) ** 2.0).mean(-1) * loss_mask).sum() / n_elem
+                ce = torch.nn.functional.cross_entropy(logits.transpose(1, -1), ids)
+                z_loss = 1e-4 * torch.square(output.logsumexp(dim=-1) * loss_mask).sum() / n_elem
+                loss = mse + ce
+
+                accuracy = torch.eq(logits.argmax(-1), ids).float().sum() / n_elem
+
+            if self.use_fp16:
+                loss_scale = 2 ** self.log_loss_scale
+                (loss * loss_scale).backward()
+            else:
+                loss.backward()
+
+            # Losses
+            n_elem = n_elem.item()
             logger.log_kv_mean("loss", loss.item(), n_elem)
-            logger.log_kv_mean("ce", results.ce.item(), n_elem)
-            logger.log_kv_mean("wce", results.weighted_ce.item(), n_elem)
-            logger.log_kv_mean("accuracy", results.accuracy.item(), n_elem)
+            logger.log_kv_mean("mse", mse.item(), n_elem)
+            logger.log_kv_mean("ce", ce.item(), n_elem)
+            logger.log_kv_mean("z_loss", z_loss.item(), n_elem)
 
+            # Model Metrics
+            logits_mean = (logits.mean(-1) * loss_mask).sum() / n_elem
+            logger.log_kv_mean("logits_mean", logits_mean.item(), n_elem)
+            logger.log_kv_mean("accuracy", accuracy.item(), n_elem)
+
+            # Performance Metrics
             n_token, n_mask = length_mask.sum().item(), conditioning_mask.sum().item()
             logger.log_kv_mean("n_token", n_token)
             logger.log_kv_mean("p_mask", n_mask / n_token, n_token)
@@ -286,14 +307,40 @@ class Trainer:
         logger.log_kv("lr", lr)
 
     def _log_anisotropy(self):
-        logger.log_kv("anisotropy", compute_anisotropy(self.model.embedding.weight).item())
+        logger.log_kv("anisotropy", compute_anisotropy(self.model.autoencoder.embedding.weight).item())
 
     def _log_step(self):
         logger.log_kv("step", self.global_step)
         if self.use_fp16:
             logger.log_kv("log_loss_scale", self.log_loss_scale)
 
-    def prepare_conditioning(self):
+    @torch.inference_mode()
+    def sample(self):
+        self.model.eval()
+        conditioning_ids, conditioning_mask = self._prepare_conditioning()
+        conditioning = self.model.encode(conditioning_ids)
+
+        z = torch.randn((*conditioning_mask.size(), self.model.dim), device=self.device)
+        us = torch.arange(self.sample_iterations, device=z.device) / (self.sample_iterations - 1)
+        ts = self.diffusion.rho_schedule(us.unsqueeze(-1))
+
+        logger.info(f"sampling started...")
+        output = self.diffusion.sample_euler(
+            model=self.model,
+            x_start=z * ts[0],
+            ts=ts,
+            postprocessing=self.model.recode,
+            conditioning=conditioning,
+            conditioning_mask=conditioning_mask,
+        )
+        logits = self.model.decode(output)
+        self.model.train()
+
+        output_ids = torch.where(conditioning_mask, conditioning_ids, logits.argmax(-1)).cpu().tolist()
+        decoded = self.tokenizer.decode(output_ids)
+        [logger.info(f"sample {i}:\t{unidecode(text)}") for i, text in enumerate(decoded)]
+
+    def _prepare_conditioning(self):
         conditioning_ids = torch.zeros(self.sample_size, dtype=torch.int64, device=self.device)
         conditioning_mask = torch.zeros_like(conditioning_ids, dtype=torch.bool)
 
@@ -305,28 +352,3 @@ class Trainer:
                 conditioning_mask[i, :sublist_len] = True
 
         return conditioning_ids, conditioning_mask
-
-    @torch.inference_mode()
-    def sample(self):
-        self.model.eval()
-        conditioning_ids, conditioning_mask = self.prepare_conditioning()
-        conditioning = self.model.embed(conditioning_ids)
-
-        z = torch.randn((*conditioning_mask.size(), self.model.embedding_dim), device=self.device)
-        us = torch.arange(self.sample_iterations, device=z.device) / (self.sample_iterations - 1)
-        ts = self.diffusion.rho_schedule(us.unsqueeze(-1))
-
-        logger.info(f"sampling started...")
-        logits = self.diffusion.sample_euler(
-            model=self.model,
-            x_start=z * ts[0],
-            ts=ts,
-            interpolate=self.model.interpolate,
-            conditioning=conditioning,
-            conditioning_mask=conditioning_mask,
-        )
-        self.model.train()
-
-        output_ids = torch.where(conditioning_mask, conditioning_ids, logits.argmax(-1)).cpu().tolist()
-        decoded = self.tokenizer.decode(output_ids)
-        [logger.info(f"sample {i}:\t{unidecode(text)}") for i, text in enumerate(decoded)]

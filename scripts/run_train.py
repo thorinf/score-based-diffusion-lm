@@ -20,19 +20,18 @@ def main():
 
     model = ScoreLM(
         num_classes=len(tokenizer),
-        model_dim=args.model_dim,
-        embedding_dim=args.embedding_dim,
+        dim=args.dim,
         num_layers=args.num_layers,
         num_heads=args.num_heads,
         dropout_prob=args.dropout_prob,
-        layerdrop_prob=args.layerdrop_prob,
     )
 
     diffusion = MultiStepScoreDiffusion(
         sigma_min=args.sigma_min,
         sigma_max=args.sigma_max,
         sigma_data=1.0,
-        rho=args.rho
+        rho=args.rho,
+        scale_model_output=args.scale_model_output
     )
 
     num_params = sum(p.numel() for p in model.parameters())
@@ -109,8 +108,7 @@ def create_argparser():
     parser.add_argument('-lgi', '--save_interval', type=int, default=5000)
     parser.add_argument('-smi', '--sample_interval', type=int, default=10000)
 
-    parser.add_argument('-edim', '--embedding_dim', type=int, default=256)
-    parser.add_argument('-mdim', '--model_dim', type=int, default=1024)
+    parser.add_argument('-dim', '--dim', type=int, default=1024)
     parser.add_argument('-nl', '--num_layers', type=int, default=8)
     parser.add_argument('-nh', '--num_heads', type=int, default=8)
     parser.add_argument('-dop', '--dropout_prob', type=float, default=0.1)
@@ -127,10 +125,11 @@ def create_argparser():
     parser.add_argument('-smin', '--sigma_min', type=float, default=1.0)
     parser.add_argument('-smax', '--sigma_max', type=float, default=10.0)
     parser.add_argument('-rho', '--rho', type=float, default=1.0)
+    parser.add_argument('-smo', '--scale_model_output', type=bool, default=True)
     parser.add_argument('-nex', '--num_examples', type=int, default=8)
 
     parser.add_argument('-mdir', '--model_dir', type=str, required=True)
-    parser.add_argument('-d', '--data_path', type=str, required=True)
+    parser.add_argument('-dat', '--data_path', type=str, required=True)
     parser.add_argument('-spm', '--spm_model', type=str, required=True)
 
     return parser

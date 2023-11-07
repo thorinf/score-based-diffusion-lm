@@ -32,8 +32,8 @@ class MultiHeadAttention(nn.Module):
             q: torch.Tensor,
             k: torch.Tensor,
             v: torch.Tensor,
-            freqs_cis: Optional[torch.Tensor],
-            mask: Optional[torch.Tensor],
+            freqs_cis: Optional[torch.Tensor] = None,
+            mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         bsz, seqlen, _ = q.shape
 
@@ -134,56 +134,84 @@ class LearnedSinusoidalPosEmb(nn.Module):
         return torch.cat([x, freq.sin(), freq.cos()], dim=-1)
 
 
-class ScoreLM(nn.Module):
+class SphereNorm(nn.Module):
+    def __init__(self):
+        super(SphereNorm, self).__init__()
+
+    @staticmethod
+    def forward(x: torch.Tensor) -> torch.Tensor:
+        return torch.nn.functional.normalize(x, dim=-1) * math.sqrt(x.shape[-1])
+
+
+class TokenAutoEncoder(nn.Module):
     def __init__(
             self,
             num_classes: int,
-            model_dim: int = 1024,
-            embedding_dim: int = 1024,
+            dim: int = 1024,
+    ):
+        super(TokenAutoEncoder, self).__init__()
+        self.num_classes = num_classes
+        self.dim = dim
+
+        self.embedding = nn.Embedding(self.num_classes, self.dim)
+        self.embedding_norm = SphereNorm()
+
+        self.norm = nn.LayerNorm(self.dim)
+        self.output = nn.Linear(self.dim, self.num_classes, bias=False)
+
+    def encode(self, ids_or_weights: torch.Tensor) -> torch.Tensor:
+        if ids_or_weights.dtype == torch.int64:
+            return self.embedding_norm(self.embedding(ids_or_weights))
+        elif ids_or_weights.dtype in (torch.float16, torch.float32, torch.float64):
+            return ids_or_weights @ self.embedding_norm(self.embedding.weight)
+        else:
+            assert False, f"Unsupported type {ids_or_weights.dtype}. Supported dtypes are int64 and float types."
+
+    def decode(self, x: torch.Tensor) -> torch.Tensor:
+        h = self.norm(x)
+        output = self.output(h).float()
+        return output
+
+    def recode(self, x: torch.Tensor) -> torch.Tensor:
+        w = self.decode(x).softmax(-1)
+        e = self.encode(w)
+        return e
+
+
+class ScoreTransformer(nn.Module):
+    def __init__(
+            self,
+            dim: int = 1024,
             num_layers: int = 8,
             num_heads: int = 16,
-            learned_sinusoidal_dim: int = 128,
+            fourier_dim: int = 128,
             dropout_prob: float = 0.0,
-            layerdrop_prob: float = 0.0
     ):
-        super(ScoreLM, self).__init__()
-        self.num_classes = num_classes
-        self.embedding_dim = embedding_dim
-        self.model_dim = model_dim
+        super(ScoreTransformer, self).__init__()
+        self.dim = dim
         self.num_layers = num_layers
         self.num_heads = num_heads
-        self.learned_sinusoidal_dim = learned_sinusoidal_dim
+        self.fourier_dim = fourier_dim
         self.dropout_prob = dropout_prob
-        self.layerdrop_prob = layerdrop_prob
-        self.interpolate_temperature = 1.0
-
-        self.embedding = nn.Embedding(self.num_classes, self.embedding_dim)
-
-        self.project = nn.Linear(self.embedding_dim, self.model_dim)
 
         self.time_embed = nn.Sequential(
-            LearnedSinusoidalPosEmb(learned_sinusoidal_dim),
-            nn.Linear(self.learned_sinusoidal_dim + 1, 128),
+            LearnedSinusoidalPosEmb(fourier_dim),
+            nn.Linear(self.fourier_dim + 1, 128),
             nn.GELU(),
             nn.Dropout(self.dropout_prob),
             nn.Linear(128, 128),
             nn.GELU()
         )
-
         self.encoder_layers = nn.ModuleList(
             TransformerBlock(
-                dim=self.model_dim,
-                hidden_dim=4 * self.model_dim,
+                dim=self.dim,
+                hidden_dim=4 * self.dim,
                 film_dim=128,
                 num_heads=self.num_heads,
                 dropout_prob=self.dropout_prob
             )
             for _ in range(num_layers)
         )
-
-        self.output = nn.Linear(self.model_dim, self.num_classes)
-
-        self.apply(self.initialisation)
 
     @staticmethod
     def initialisation(module):
@@ -196,28 +224,26 @@ class ScoreLM(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, mean=0.0, std=0.001)
 
-    def embed(self, ids):
-        e = self.embedding(ids)
-        e = F.normalize(e, dim=-1) * math.sqrt(self.embedding_dim)
-        return e
-
-    def interpolate(self, logits):
-        emb_weights = (logits / self.interpolate_temperature).softmax(dim=-1)
-        norm_emb = F.normalize(self.embedding.weight, dim=-1) * math.sqrt(self.embedding_dim)
-        return emb_weights @ norm_emb
-
     def self_attention_mask(self, length_mask):
         bsz, seqlen = length_mask.shape
         mask = torch.logical_and(length_mask.view(bsz, 1, 1, seqlen), length_mask.view(bsz, 1, seqlen, 1))
         return mask.expand(bsz, self.num_heads, seqlen, seqlen)
 
-    def forward(self, x, t, length_mask=None, attention_mask=None, conditioning=None, conditioning_mask=None):
+    def forward(
+            self,
+            x: torch.Tensor,
+            t: torch.Tensor,
+            length_mask: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            conditioning: Optional[torch.Tensor] = None,
+            conditioning_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         bsz, seqlen, _ = x.shape
 
         t = append_dims(t, x.ndim)
 
         t_seq = torch.arange(seqlen, device=x.device).unsqueeze(0)
-        freq_cis = rope.compute_freqs_cis(t_seq, self.model_dim // self.num_heads)
+        freq_cis = rope.compute_freqs_cis(t_seq, self.dim // self.num_heads)
 
         if conditioning is not None and conditioning_mask is not None:
             x = torch.where(append_dims(conditioning_mask, x.ndim), conditioning, x)
@@ -228,11 +254,73 @@ class ScoreLM(nn.Module):
         elif attention_mask is None:
             attention_mask = self.self_attention_mask(length_mask)
 
-        h = self.project(x)
-        film = self.time_embed(append_dims(t, x.ndim))
+        h, film = x, self.time_embed(t)
 
         for i, layer in enumerate(self.encoder_layers):
             h = layer(h, film, freq_cis, attention_mask)
 
-        output = self.output(h).float()
-        return output
+        return h
+
+
+class ScoreLM(nn.Module):
+    def __init__(
+            self,
+            num_classes: int,
+            dim: int = 1024,
+            num_layers: int = 8,
+            num_heads: int = 16,
+            fourier_dim: int = 128,
+            dropout_prob: float = 0.0,
+    ):
+        super(ScoreLM, self).__init__()
+        self.num_classes = num_classes
+        self.dim = dim
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.fourier_dim = fourier_dim
+        self.dropout_prob = dropout_prob
+
+        self.autoencoder = TokenAutoEncoder(
+            num_classes=self.num_classes,
+            dim=self.dim
+        )
+        self.score_model = ScoreTransformer(
+            dim=self.dim,
+            num_layers=self.num_layers,
+            num_heads=self.num_heads,
+            fourier_dim=self.fourier_dim,
+            dropout_prob=self.dropout_prob
+        )
+
+        self.apply(initialisation)
+
+    def encode(self, ids_or_weights: torch.Tensor) -> torch.Tensor:
+        return self.autoencoder.encode(ids_or_weights)
+
+    def decode(self, x: torch.Tensor) -> torch.Tensor:
+        return self.autoencoder.decode(x)
+
+    def recode(self, x: torch.Tensor) -> torch.Tensor:
+        return self.autoencoder.recode(x)
+
+    def forward(
+            self,
+            x: torch.Tensor,
+            t: torch.Tensor,
+            length_mask: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            conditioning: Optional[torch.Tensor] = None,
+            conditioning_mask: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
+        return self.score_model(x, t, length_mask, attention_mask, conditioning, conditioning_mask)
+
+
+def initialisation(module):
+    if isinstance(module, nn.Linear):
+        fan_in = module.weight.size(1)
+        std = 1 / math.sqrt(fan_in)
+        torch.nn.init.trunc_normal_(module.weight, mean=0.0, std=std, a=-std, b=std)
+        if module.bias is not None:
+            torch.nn.init.zeros_(module.bias)
+    elif isinstance(module, nn.Embedding):
+        nn.init.normal_(module.weight, mean=0.0, std=0.001)
