@@ -74,7 +74,7 @@ def main():
 
     dataloader = infinite_loader(dataloader)
 
-    conditional_starts = get_text("../sdlm/conditional_starts.txt")
+    conditional_starts = get_text("conditional_starts.txt")
 
     trainer = Trainer(
         model=model,
