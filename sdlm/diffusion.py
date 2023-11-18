@@ -4,6 +4,7 @@ from typing import Any, Callable, List, Tuple, TypeVar, Union
 
 import torch
 import torch.nn as nn
+from torch import Tensor
 
 from .utils import append_dims
 
@@ -18,7 +19,7 @@ class ScoreLossResults:
     output: torch.Tensor
 
 
-class MultiStepScoreDiffusion:
+class ScoreDiffusion:
     def __init__(
             self,
             sigma_min: float = 1.0,
@@ -26,13 +27,15 @@ class MultiStepScoreDiffusion:
             sigma_data: float = 1.0,
             rho: float = 1.0,
             scale_model_output: bool = True,
+            detach_model_skip: bool = True,
     ) -> None:
-        super(MultiStepScoreDiffusion).__init__()
+        super(ScoreDiffusion).__init__()
         self.sigma_min = sigma_min
         self.sigma_max = sigma_max
         self.sigma_data = sigma_data
         self.rho = rho
         self.scale_model_output = scale_model_output
+        self.detach_model_skip = detach_model_skip
 
     def rho_schedule(self, u: T) -> T:
         # u [0,1], linear schedule when rho is 1.0
@@ -59,10 +62,15 @@ class MultiStepScoreDiffusion:
 
     def denoise(self, model: nn.Module, x_t: torch.Tensor, sigmas: torch.Tensor, **model_kwargs: Any) -> torch.Tensor:
         c_skip, c_out, c_in = self.get_scaling(sigmas)
+
         model_output = model(append_dims(c_in, x_t.ndim) * x_t, sigmas, **model_kwargs)
+
         if not self.scale_model_output:
             return model_output
-        return append_dims(c_out, model_output.ndim) * model_output + append_dims(c_skip, x_t.ndim) * x_t.detach()
+        else:
+            scaled_model_output = append_dims(c_out, model_output.ndim) * model_output
+            scaled_skip_connect = append_dims(c_skip, x_t.ndim) * (x_t.detach() if self.detach_model_skip else x_t)
+            return scaled_model_output + scaled_skip_connect
 
     def forward_reverse(self, model: nn.Module, x_target: torch.Tensor, **model_kwargs: Any) -> torch.Tensor:
         u_shape = x_target.shape[:1] if random.uniform(0, 1) < 1.0 else x_target.shape[:2]
@@ -100,21 +108,25 @@ class MultiStepScoreDiffusion:
             ts: torch.Tensor,
             postprocessing: Callable = None,
             **model_kwargs: Any
-    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Any]]:
         x = x_start
+        extra_args = (None,)
 
         indices = range(len(ts))
         for i in indices:
             t, t_next = ts[i], ts[i + 1] if i + 1 != len(ts) else 0.0
 
             denoised = self.denoise(model, x, t, **model_kwargs)
-            denoised = postprocessing(denoised)
+
+            if postprocessing is not None:
+                result = postprocessing(denoised)
+                denoised, *extra_args = result if isinstance(result, tuple) else (result, *extra_args)
 
             d = (x - denoised) / append_dims(t, x.ndim)
             dt = append_dims(t_next - t, d.ndim)
             x = x + (d * dt)
 
-        return x
+        return x if postprocessing is None else (x, *extra_args)
 
     @torch.no_grad()
     def sample_edm(
@@ -125,8 +137,9 @@ class MultiStepScoreDiffusion:
             postprocessing: Callable = None,
             heun: bool = False,
             **model_kwargs: Any
-    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Any]]:
         x = x_start
+        extra_args = (None,)
 
         indices = range(len(ts))
         for i in indices:
@@ -134,19 +147,25 @@ class MultiStepScoreDiffusion:
             x_cur = x
 
             denoised = self.denoise(model, x_cur, t, **model_kwargs)
-            denoised = postprocessing(denoised)
+
+            if postprocessing is not None:
+                result = postprocessing(denoised)
+                denoised, *extra_args = result if isinstance(result, tuple) else (result, *extra_args)
 
             d = (x_cur - denoised) / t
             x = x_cur + (t_next - t) * d
 
             if i < len(ts) - 1 and heun:
                 denoised = self.denoise(model, x, t_next, **model_kwargs)
-                denoised = postprocessing(denoised)
+
+                if postprocessing is not None:
+                    result = postprocessing(denoised)
+                    denoised, *extra_args = result if isinstance(result, tuple) else (result, *extra_args)
 
                 d_prime = (x - denoised) / t_next
                 x = x_cur + (t_next - t) * (0.5 * d + 0.5 * d_prime)
 
-        return x
+        return x if postprocessing is None else (x, *extra_args)
 
     @torch.no_grad()
     def sample_iterative(
@@ -156,9 +175,9 @@ class MultiStepScoreDiffusion:
             ts: torch.Tensor,
             postprocessing: Callable = None,
             **model_kwargs: Any
-    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, Any]]:
         x = x_start
-        logits = None
+        extra_args = (None,)
 
         indices = range(len(ts))
         for i in indices:
@@ -168,6 +187,9 @@ class MultiStepScoreDiffusion:
                 x = x + z * append_dims(t, z.ndim)
 
             x = self.denoise(model, x, t, **model_kwargs)
-            x = postprocessing(x)
 
-        return x
+            if postprocessing is not None:
+                result = postprocessing(x)
+                x, *extra_args = result if isinstance(result, tuple) else (result, *extra_args)
+
+        return x if postprocessing is None else (x, *extra_args)

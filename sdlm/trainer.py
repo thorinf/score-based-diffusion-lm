@@ -191,10 +191,9 @@ class Trainer:
                 ids = ids.masked_fill(~loss_mask, -100)
                 n_elem = loss_mask.sum()
 
-                mse = (((output - encoded) ** 2.0).mean(-1) * loss_mask).sum() / n_elem
                 ce = torch.nn.functional.cross_entropy(logits.transpose(1, -1), ids)
                 z_loss = 1e-4 * torch.square(output.logsumexp(dim=-1) * loss_mask).sum() / n_elem
-                loss = mse + ce
+                loss = ce
 
                 accuracy = torch.eq(logits.argmax(-1), ids).float().sum() / n_elem
 
@@ -207,7 +206,6 @@ class Trainer:
             # Losses
             n_elem = n_elem.item()
             logger.log_kv_mean("loss", loss.item(), n_elem)
-            logger.log_kv_mean("mse", mse.item(), n_elem)
             logger.log_kv_mean("ce", ce.item(), n_elem)
             logger.log_kv_mean("z_loss", z_loss.item(), n_elem)
 
@@ -320,12 +318,12 @@ class Trainer:
         conditioning_ids, conditioning_mask = self._prepare_conditioning()
         conditioning = self.model.encode(conditioning_ids)
 
-        z = torch.randn((*conditioning_mask.size(), self.model.dim), device=self.device)
+        z = torch.randn((*conditioning_mask.size(), self.model.embedding_dim), device=self.device)
         us = torch.arange(self.sample_iterations, device=z.device) / (self.sample_iterations - 1)
         ts = self.diffusion.rho_schedule(us.unsqueeze(-1))
 
         logger.info(f"sampling started...")
-        output = self.diffusion.sample_euler(
+        _, probs = self.diffusion.sample_euler(
             model=self.model,
             x_start=z * ts[0],
             ts=ts,
@@ -333,10 +331,9 @@ class Trainer:
             conditioning=conditioning,
             conditioning_mask=conditioning_mask,
         )
-        logits = self.model.decode(output)
         self.model.train()
 
-        output_ids = torch.where(conditioning_mask, conditioning_ids, logits.argmax(-1)).cpu().tolist()
+        output_ids = torch.where(conditioning_mask, conditioning_ids, probs.argmax(-1)).cpu().tolist()
         decoded = self.tokenizer.decode(output_ids)
         [logger.info(f"sample {i}:\t{unidecode(text)}") for i, text in enumerate(decoded)]
 
