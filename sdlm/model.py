@@ -92,7 +92,7 @@ class FiLM(nn.Module):
     def forward(self, x: torch.Tensor, film: torch.Tensor) -> torch.Tensor:
         h = self.norm(x)
         scale, shift = self.wf(film).chunk(2, dim=-1)
-        return (h * scale) + h
+        return (h * scale) + shift
 
 
 class TransformerBlock(nn.Module):
